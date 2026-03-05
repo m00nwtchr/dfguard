@@ -1,0 +1,21 @@
+[package]
+name = "dfguard"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Minimal mTLS-authenticating proxy for DragonflyDB/Redis"
+readme = "README.md"
+repository = "https://github.com/m00nwtchr/dfguard"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+notify = "6"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio-rustls = "0.26"
+x509-parser = "0.16"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

@@ -1,0 +1,57 @@
+name: build-container
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  IMAGE_NAME: dfguard
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+
+      - name: Install devenv
+        uses: cachix/devenv-action@v2
+
+      - name: Build container
+        run: devenv container build prod
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish rolling tag
+        run: |
+          devenv container \
+            --registry "docker://ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:rolling" \
+            --copy-args "--dest-creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            copy prod
+
+      - name: Publish latest tag
+        run: |
+          devenv container \
+            --registry "docker://ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest" \
+            --copy-args "--dest-creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+            copy prod
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign images
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes "ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:rolling"
+          cosign sign --yes "ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
