@@ -37,21 +37,23 @@ jobs:
         run: nix profile add nixpkgs#devenv
 
       - name: Build container
-        run: devenv container build prod
+        run: |
+          devenv container copy \
+            --registry "docker-daemon:" \
+            prod
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Publish rolling tag
         run: |
-          devenv container copy \
-            --registry "docker://ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:rolling" \
-            --copy-args "--dest-creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            prod
+          docker tag "${{ env.IMAGE_NAME }}:latest" "ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:rolling"
+          docker push "ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:rolling"
 
       - name: Publish latest tag
         run: |
-          devenv container copy \
-            --registry "docker://ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest" \
-            --copy-args "--dest-creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            prod
+          docker tag "${{ env.IMAGE_NAME }}:latest" "ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+          docker push "ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.7.0
