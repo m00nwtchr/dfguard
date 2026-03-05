@@ -10,7 +10,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use clap::Parser;
 use notify::{RecursiveMode, Watcher};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    ServerName,
+};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -437,11 +440,15 @@ fn build_client_config(config: &Config) -> Result<ClientConfig> {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path).with_context(|| format!("open cert file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("read certificates")?;
+    let pem_data =
+        std::fs::read(path).with_context(|| format!("read cert file {}", path.display()))?;
+    let blocks = pem::parse_many(pem_data).context("parse cert PEM")?;
+    let mut certs = Vec::new();
+    for block in blocks {
+        if block.tag() == "CERTIFICATE" {
+            certs.push(CertificateDer::from(block.contents().to_vec()));
+        }
+    }
     if certs.is_empty() {
         bail!("no certificates found in {}", path.display());
     }
@@ -449,12 +456,28 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(path).with_context(|| format!("open key file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .context("read private key")?
-        .ok_or_else(|| anyhow!("no private key found in {}", path.display()))?;
-    Ok(key)
+    let pem_data =
+        std::fs::read(path).with_context(|| format!("read key file {}", path.display()))?;
+    let blocks = pem::parse_many(pem_data).context("parse key PEM")?;
+    for block in blocks {
+        let key = match block.tag() {
+            "PRIVATE KEY" => {
+                let key = PrivatePkcs8KeyDer::from(block.contents().to_vec());
+                PrivateKeyDer::from(key)
+            }
+            "RSA PRIVATE KEY" => {
+                let key = PrivatePkcs1KeyDer::from(block.contents().to_vec());
+                PrivateKeyDer::from(key)
+            }
+            "EC PRIVATE KEY" => {
+                let key = PrivateSec1KeyDer::from(block.contents().to_vec());
+                PrivateKeyDer::from(key)
+            }
+            _ => continue,
+        };
+        return Ok(key);
+    }
+    bail!("no private key found in {}", path.display())
 }
 
 async fn send_auth(
