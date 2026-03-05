@@ -39,9 +39,6 @@ jobs:
       - name: Build container
         run: devenv container build prod
 
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
       - name: Publish rolling tag
         run: |
           devenv container copy \
