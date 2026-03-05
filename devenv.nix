@@ -28,7 +28,7 @@ in
   containers."prod" = {
     inherit name;
 
-    copyToRoot = "${pkgs}/bin/${name}";
+    copyToRoot = "${pkg}/bin/${name}";
     startupCommand = "/${name}";
   };
 
