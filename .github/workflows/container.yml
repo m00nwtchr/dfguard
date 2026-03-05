@@ -44,17 +44,17 @@ jobs:
 
       - name: Publish rolling tag
         run: |
-          devenv container \
+          devenv container copy \
             --registry "docker://ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:rolling" \
             --copy-args "--dest-creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            copy prod
+            prod
 
       - name: Publish latest tag
         run: |
-          devenv container \
+          devenv container copy \
             --registry "docker://ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest" \
             --copy-args "--dest-creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-            copy prod
+            prod
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.7.0
