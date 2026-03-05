@@ -7,8 +7,6 @@
 }:
 let
   name = "dfguard";
-
-  pkg = config.languages.rust.import ./. { };
 in
 {
   cachix.enable = true;
@@ -22,15 +20,7 @@ in
       git
       cargo-nextest
       cargo-audit
-    ])
-    ++ lib.optionals (!config.containers."prod".isBuilding) [ pkg ];
-
-  containers."prod" = {
-    inherit name;
-
-    copyToRoot = "${pkg}/bin/${name}";
-    startupCommand = "/${name}";
-  };
+    ]);
 
   # https://devenv.sh/languages/
   languages.rust = {
@@ -59,7 +49,7 @@ in
   };
 
   outputs = {
-    ${name} = pkg;
+    ${name} = config.languages.rust.import ./. { };
   };
 
   # See full reference at https://devenv.sh/reference/options/
