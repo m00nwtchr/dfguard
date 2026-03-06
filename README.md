@@ -75,7 +75,3 @@ The ACL file is watched with inotify (via `notify`) and reloaded on changes.
 
 - The proxy is minimally invasive: it only injects initial `AUTH` and blocks downstream `AUTH`.
 - Secrets are never logged.
-
-## License
-
-MPL-2.0
