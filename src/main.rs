@@ -23,7 +23,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -135,9 +135,17 @@ async fn handle_connection(
     let server_config = server_rx.borrow().clone();
     let acceptor = TlsAcceptor::from(server_config);
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
-    let tls_stream = timeout(handshake_timeout, acceptor.accept(socket))
-        .await
-        .context("downstream TLS handshake timeout")??;
+    let tls_stream = match timeout(handshake_timeout, acceptor.accept(socket)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            if is_tls_handshake_eof(&err) {
+                debug!("downstream TLS handshake eof");
+                return Ok(());
+            }
+            return Err(anyhow!(err)).context("downstream TLS handshake failed");
+        }
+        Err(_) => return Err(anyhow!("downstream TLS handshake timeout")),
+    };
 
     let user = extract_dns_user(&tls_stream)?;
     let acl = acl_rx.borrow().clone();
@@ -831,4 +839,15 @@ fn should_retry_without_resumption(err: &anyhow::Error) -> bool {
         }
     }
     err.to_string().contains("InternalError")
+}
+
+fn is_tls_handshake_eof(err: &dyn std::error::Error) -> bool {
+    let mut current: Option<&dyn std::error::Error> = Some(err);
+    while let Some(cause) = current {
+        if cause.to_string().contains("tls handshake eof") {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
 }
