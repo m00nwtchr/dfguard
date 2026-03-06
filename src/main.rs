@@ -4,23 +4,26 @@ use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use clap::Parser;
 use notify::{RecursiveMode, Watcher};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
     ServerName,
 };
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{AlertDescription, ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -54,20 +57,30 @@ struct Config {
     idle_timeout_secs: u64,
     #[arg(long, default_value = "16777216")]
     max_frame_size: usize,
+
+    #[arg(long, default_value_t = false)]
+    insecure_upstream: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_target(false).init();
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
     let config = Config::parse();
     let acl = load_acl(&config.acl)?;
     let (acl_tx, acl_rx) = watch::channel(Arc::new(acl));
 
     let server_config = build_server_config(&config)?;
-    let client_config = build_client_config(&config)?;
+    let client_config = build_client_config(&config, false)?;
+    let client_config_no_resumption = build_client_config(&config, true)?;
 
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let connector = TlsConnector::from(Arc::new(client_config));
+    let connector_no_resumption = TlsConnector::from(Arc::new(client_config_no_resumption));
+    let resumption_enabled = Arc::new(AtomicBool::new(true));
 
     let listener = TcpListener::bind(&config.listen)
         .await
@@ -82,10 +95,22 @@ async fn main() -> Result<()> {
         let (socket, _) = listener.accept().await?;
         let acceptor = acceptor.clone();
         let connector = connector.clone();
+        let connector_no_resumption = connector_no_resumption.clone();
+        let resumption_enabled = resumption_enabled.clone();
         let acl_rx = acl_rx.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(socket, acceptor, connector, acl_rx, config).await {
+            if let Err(err) = handle_connection(
+                socket,
+                acceptor,
+                connector,
+                connector_no_resumption,
+                resumption_enabled,
+                acl_rx,
+                config,
+            )
+            .await
+            {
                 error!("connection error: {err:#}");
             }
         });
@@ -96,6 +121,8 @@ async fn handle_connection(
     socket: TcpStream,
     acceptor: TlsAcceptor,
     connector: TlsConnector,
+    connector_no_resumption: TlsConnector,
+    resumption_enabled: Arc<AtomicBool>,
     acl_rx: watch::Receiver<Arc<HashMap<String, String>>>,
     config: Arc<Config>,
 ) -> Result<()> {
@@ -113,23 +140,45 @@ async fn handle_connection(
 
     let (upstream_host, _upstream_port) = parse_host_port(&config.upstream)?;
     let upstream_addr = resolve_addr(&config.upstream)?;
+    let server_name = parse_server_name(&upstream_host)?;
 
-    let upstream_socket = timeout(handshake_timeout, TcpStream::connect(upstream_addr))
+    let mut upstream_tls = if resumption_enabled.load(Ordering::Relaxed) {
+        match connect_upstream(
+            &connector,
+            upstream_addr,
+            server_name.clone(),
+            handshake_timeout,
+        )
         .await
-        .context("upstream TCP connect timeout")??;
-
-    let server_name = match upstream_host.parse::<std::net::IpAddr>() {
-        Ok(ip) => ServerName::IpAddress(ip.into()),
-        Err(_) => ServerName::try_from(upstream_host.clone())
-            .context("invalid upstream hostname for TLS")?,
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                if should_retry_without_resumption(&err) {
+                    info!("upstream TLS resumption failed, retrying without resumption");
+                    let stream = connect_upstream(
+                        &connector_no_resumption,
+                        upstream_addr,
+                        server_name,
+                        handshake_timeout,
+                    )
+                    .await?;
+                    resumption_enabled.store(false, Ordering::Relaxed);
+                    info!("upstream TLS resumption disabled for future connections");
+                    stream
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    } else {
+        connect_upstream(
+            &connector_no_resumption,
+            upstream_addr,
+            server_name,
+            handshake_timeout,
+        )
+        .await?
     };
-
-    let mut upstream_tls = timeout(
-        handshake_timeout,
-        connector.connect(server_name, upstream_socket),
-    )
-    .await
-    .context("upstream TLS handshake timeout")??;
 
     send_auth(&mut upstream_tls, &user, &password).await?;
 
@@ -425,18 +474,75 @@ fn build_server_config(config: &Config) -> Result<ServerConfig> {
     Ok(server_config)
 }
 
-fn build_client_config(config: &Config) -> Result<ClientConfig> {
+fn build_client_config(config: &Config, disable_resumption: bool) -> Result<ClientConfig> {
     let certs = load_certs(&config.upstream_cert)?;
     let key = load_private_key(&config.upstream_key)?;
     let mut roots = RootCertStore::empty();
     for cert in load_certs(&config.upstream_ca)? {
         roots.add(cert).context("add upstream CA")?;
     }
-    let client_config = ClientConfig::builder()
+    let mut client_config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)
         .context("build upstream TLS config")?;
+
+    if config.insecure_upstream {
+        client_config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(InsecureVerifier));
+    }
+    if disable_resumption {
+        client_config.resumption = rustls::client::Resumption::disabled();
+    }
     Ok(client_config)
+}
+
+#[derive(Debug)]
+struct InsecureVerifier;
+
+impl ServerCertVerifier for InsecureVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -623,4 +729,42 @@ fn find_crlf_from(buf: &[u8], start: usize) -> Option<usize> {
 struct FrameInfo {
     len: usize,
     is_auth: bool,
+}
+
+async fn connect_upstream(
+    connector: &TlsConnector,
+    addr: SocketAddr,
+    server_name: ServerName<'static>,
+    timeout_duration: Duration,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let upstream_socket = timeout(timeout_duration, TcpStream::connect(addr))
+        .await
+        .context("upstream TCP connect timeout")??;
+    let upstream_tls = timeout(
+        timeout_duration,
+        connector.connect(server_name, upstream_socket),
+    )
+    .await
+    .context("upstream TLS handshake timeout")??;
+    Ok(upstream_tls)
+}
+
+fn parse_server_name(host: &str) -> Result<ServerName<'static>> {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => Ok(ServerName::IpAddress(ip.into())),
+        Err(_) => {
+            ServerName::try_from(host.to_string()).context("invalid upstream hostname for TLS")
+        }
+    }
+}
+
+fn should_retry_without_resumption(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(rustls::Error::AlertReceived(desc)) = cause.downcast_ref::<rustls::Error>() {
+            if *desc == AlertDescription::InternalError {
+                return true;
+            }
+        }
+    }
+    err.to_string().contains("InternalError")
 }

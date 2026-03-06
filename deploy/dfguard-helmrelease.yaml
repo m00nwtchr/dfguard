@@ -1,0 +1,117 @@
+# yaml-language-server: $schema=https://k8s-schemas.m00nlit.dev/source.toolkit.fluxcd.io/ocirepository_v1.json
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: app-template
+  namespace: default
+spec:
+  interval: 5m
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy
+  ref:
+    tag: 4.6.2
+  url: oci://ghcr.io/bjw-s-labs/helm/app-template
+  verify:
+    provider: cosign
+    matchOIDCIdentity:
+      - issuer: "^https://token.actions.githubusercontent.com$"
+        subject: "^https://github.com/bjw-s-labs/helm-charts.*$"
+---
+apiVersion: helm.toolkit.fluxcd.io/v2beta2
+kind: HelmRelease
+metadata:
+  name: dfguard
+  namespace: default
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: app-template
+      sourceRef:
+        kind: OCIRepository
+        name: app-template
+        namespace: default
+  values:
+    defaultPodOptions:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+    controllers:
+      dfguard:
+        containers:
+          app:
+            image:
+              repository: ghcr.io/m00nwtchr/dfguard
+              tag: rolling
+            args:
+              - --listen
+              - 0.0.0.0:6380
+              - --upstream
+              - dfguard:6379
+              - --acl
+              - /config/acl.conf
+              - --server-cert
+              - /tls/server/tls.crt
+              - --server-key
+              - /tls/server/tls.key
+              - --server-ca
+              - /tls/server/ca.crt
+              - --upstream-cert
+              - /tls/upstream/tls.crt
+              - --upstream-key
+              - /tls/upstream/tls.key
+              - --upstream-ca
+              - /tls/upstream/ca.crt
+            probes:
+              liveness:
+                enabled: true
+                type: TCP
+                port: 6380
+              readiness:
+                enabled: true
+                type: TCP
+                port: 6380
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 128Mi
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                  - ALL
+              seccompProfile:
+                type: RuntimeDefault
+    service:
+      app:
+        controller: dfguard
+        ports:
+          redis:
+            port: 6380
+    persistence:
+      acl:
+        type: configMap
+        name: dfguard-acl
+        globalMounts:
+          - path: /config
+            readOnly: true
+      server-tls:
+        type: secret
+        name: dfguard-server-tls
+        globalMounts:
+          - path: /tls/server
+            readOnly: true
+      upstream-tls:
+        type: secret
+        name: dfguard-upstream-tls
+        globalMounts:
+          - path: /tls/upstream
+            readOnly: true

@@ -1,0 +1,71 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dfguard-server-ca
+  namespace: default
+spec:
+  isCA: true
+  commonName: dfguard-server-ca
+  secretName: dfguard-server-ca
+  issuerRef:
+    name: dfguard-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dfguard-upstream-ca
+  namespace: default
+spec:
+  isCA: true
+  commonName: dfguard-upstream-ca
+  secretName: dfguard-upstream-ca
+  issuerRef:
+    name: dfguard-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: dfguard-server-ca-issuer
+  namespace: default
+spec:
+  ca:
+    secretName: dfguard-server-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: dfguard-upstream-ca-issuer
+  namespace: default
+spec:
+  ca:
+    secretName: dfguard-upstream-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dfguard-server-tls
+  namespace: default
+spec:
+  secretName: dfguard-server-tls
+  commonName: app
+  dnsNames:
+    - app
+  issuerRef:
+    name: dfguard-server-ca-issuer
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dfguard-upstream-tls
+  namespace: default
+spec:
+  secretName: dfguard-upstream-tls
+  commonName: dfguard
+  dnsNames:
+    - dfguard
+  issuerRef:
+    name: dfguard-upstream-ca-issuer
+    kind: Issuer

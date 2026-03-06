@@ -34,6 +34,22 @@ cargo build --release
   --upstream-cert /path/to/upstream.crt \
   --upstream-key /path/to/upstream.key \
   --upstream-ca /path/to/upstream-ca.crt
+
+# Insecure upstream TLS (skips verification)
+
+```bash
+./target/release/dfguard \
+  --insecure-upstream \
+  --listen 0.0.0.0:6380 \
+  --upstream dragonfly.example:6379 \
+  --acl /path/to/acl.conf \
+  --server-cert /path/to/server.crt \
+  --server-key /path/to/server.key \
+  --server-ca /path/to/server-ca.crt \
+  --upstream-cert /path/to/upstream.crt \
+  --upstream-key /path/to/upstream.key \
+  --upstream-ca /path/to/upstream-ca.crt
+```
 ```
 
 ## ACL format
