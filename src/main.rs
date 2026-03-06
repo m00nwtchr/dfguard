@@ -62,6 +62,12 @@ struct Config {
     insecure_upstream: bool,
 }
 
+#[derive(Clone)]
+struct ClientConfigs {
+    with_resumption: Arc<ClientConfig>,
+    no_resumption: Arc<ClientConfig>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -73,13 +79,13 @@ async fn main() -> Result<()> {
     let acl = load_acl(&config.acl)?;
     let (acl_tx, acl_rx) = watch::channel(Arc::new(acl));
 
-    let server_config = build_server_config(&config)?;
-    let client_config = build_client_config(&config, false)?;
-    let client_config_no_resumption = build_client_config(&config, true)?;
-
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
-    let connector = TlsConnector::from(Arc::new(client_config));
-    let connector_no_resumption = TlsConnector::from(Arc::new(client_config_no_resumption));
+    let server_config = Arc::new(build_server_config(&config)?);
+    let client_configs = Arc::new(ClientConfigs {
+        with_resumption: Arc::new(build_client_config(&config, false)?),
+        no_resumption: Arc::new(build_client_config(&config, true)?),
+    });
+    let (server_tx, server_rx) = watch::channel(server_config);
+    let (client_tx, client_rx) = watch::channel(client_configs);
     let resumption_enabled = Arc::new(AtomicBool::new(true));
 
     let listener = TcpListener::bind(&config.listen)
@@ -90,21 +96,20 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(config);
     let _acl_watcher = start_acl_watcher(config.acl.clone(), acl_tx)?;
+    let _tls_watcher = start_tls_watcher(config.clone(), server_tx, client_tx)?;
 
     loop {
         let (socket, _) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let connector = connector.clone();
-        let connector_no_resumption = connector_no_resumption.clone();
+        let server_rx = server_rx.clone();
+        let client_rx = client_rx.clone();
         let resumption_enabled = resumption_enabled.clone();
         let acl_rx = acl_rx.clone();
         let config = config.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 socket,
-                acceptor,
-                connector,
-                connector_no_resumption,
+                server_rx,
+                client_rx,
                 resumption_enabled,
                 acl_rx,
                 config,
@@ -119,13 +124,14 @@ async fn main() -> Result<()> {
 
 async fn handle_connection(
     socket: TcpStream,
-    acceptor: TlsAcceptor,
-    connector: TlsConnector,
-    connector_no_resumption: TlsConnector,
+    server_rx: watch::Receiver<Arc<ServerConfig>>,
+    client_rx: watch::Receiver<Arc<ClientConfigs>>,
     resumption_enabled: Arc<AtomicBool>,
     acl_rx: watch::Receiver<Arc<HashMap<String, String>>>,
     config: Arc<Config>,
 ) -> Result<()> {
+    let server_config = server_rx.borrow().clone();
+    let acceptor = TlsAcceptor::from(server_config);
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
     let tls_stream = timeout(handshake_timeout, acceptor.accept(socket))
         .await
@@ -141,6 +147,9 @@ async fn handle_connection(
     let (upstream_host, _upstream_port) = parse_host_port(&config.upstream)?;
     let upstream_addr = resolve_addr(&config.upstream)?;
     let server_name = parse_server_name(&upstream_host)?;
+    let client_configs = client_rx.borrow().clone();
+    let connector = TlsConnector::from(client_configs.with_resumption.clone());
+    let connector_no_resumption = TlsConnector::from(client_configs.no_resumption.clone());
 
     let mut upstream_tls = if resumption_enabled.load(Ordering::Relaxed) {
         match connect_upstream(
@@ -361,6 +370,66 @@ fn start_acl_watcher(
     Ok(watcher)
 }
 
+fn start_tls_watcher(
+    config: Arc<Config>,
+    server_tx: watch::Sender<Arc<ServerConfig>>,
+    client_tx: watch::Sender<Arc<ClientConfigs>>,
+) -> Result<notify::RecommendedWatcher> {
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<()>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.is_ok() {
+            let _ = event_tx.send(());
+        }
+    })
+    .context("create TLS watcher")?;
+
+    let paths = vec![
+        config.server_cert.clone(),
+        config.server_key.clone(),
+        config.server_ca.clone(),
+        config.upstream_cert.clone(),
+        config.upstream_key.clone(),
+        config.upstream_ca.clone(),
+    ];
+    for path in &paths {
+        watcher
+            .watch(path, RecursiveMode::NonRecursive)
+            .with_context(|| format!("watch TLS file {}", path.display()))?;
+    }
+
+    tokio::spawn(async move {
+        while event_rx.recv().await.is_some() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            match build_server_config(config.as_ref()) {
+                Ok(server_config) => {
+                    let _ = server_tx.send(Arc::new(server_config));
+                    info!("server TLS config reloaded");
+                }
+                Err(err) => error!("server TLS reload failed: {err:#}"),
+            }
+
+            match (
+                build_client_config(config.as_ref(), false),
+                build_client_config(config.as_ref(), true),
+            ) {
+                (Ok(with_resumption), Ok(no_resumption)) => {
+                    let configs = ClientConfigs {
+                        with_resumption: Arc::new(with_resumption),
+                        no_resumption: Arc::new(no_resumption),
+                    };
+                    let _ = client_tx.send(Arc::new(configs));
+                    info!("upstream TLS config reloaded");
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    error!("upstream TLS reload failed: {err:#}");
+                }
+            }
+        }
+    });
+
+    Ok(watcher)
+}
+
 fn parse_acl_lines<I>(lines: I) -> Result<HashMap<String, String>>
 where
     I: Iterator<Item = std::io::Result<String>>,
@@ -403,10 +472,10 @@ where
         let user = tokens[setuser_index + 1].to_string();
         let mut password: Option<String> = None;
         for token in tokens.iter().skip(setuser_index + 2) {
-            if let Some(rest) = token.strip_prefix('>') {
-                if !rest.is_empty() {
-                    password = Some(rest.to_string());
-                }
+            if let Some(rest) = token.strip_prefix('>')
+                && !rest.is_empty()
+            {
+                password = Some(rest.to_string());
             }
         }
         let password = match password {
@@ -760,10 +829,10 @@ fn parse_server_name(host: &str) -> Result<ServerName<'static>> {
 
 fn should_retry_without_resumption(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
-        if let Some(rustls::Error::AlertReceived(desc)) = cause.downcast_ref::<rustls::Error>() {
-            if *desc == AlertDescription::InternalError {
-                return true;
-            }
+        if let Some(rustls::Error::AlertReceived(desc)) = cause.downcast_ref::<rustls::Error>()
+            && *desc == AlertDescription::InternalError
+        {
+            return true;
         }
     }
     err.to_string().contains("InternalError")
