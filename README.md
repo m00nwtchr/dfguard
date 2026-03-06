@@ -37,7 +37,6 @@ cargo build --release
 
 # Insecure upstream TLS (skips verification)
 
-```bash
 ./target/release/dfguard \
   --insecure-upstream \
   --listen 0.0.0.0:6380 \
@@ -49,7 +48,6 @@ cargo build --release
   --upstream-cert /path/to/upstream.crt \
   --upstream-key /path/to/upstream.key \
   --upstream-ca /path/to/upstream-ca.crt
-```
 ```
 
 ## ACL format
