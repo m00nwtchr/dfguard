@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic)]
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -122,6 +123,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     socket: TcpStream,
     server_rx: watch::Receiver<Arc<ServerConfig>>,
@@ -215,9 +217,8 @@ async fn handle_connection(
                     downstream_writer.write_all(&buffer[..n]).await?;
                 }
                 msg = err_rx.recv() => {
-                    match msg {
-                        Some(payload) => downstream_writer.write_all(&payload).await?,
-                        None => continue,
+                    if let Some(payload) = msg {
+                        downstream_writer.write_all(&payload).await?;
                     }
                 }
             }
@@ -242,9 +243,8 @@ async fn handle_connection(
             }
 
             loop {
-                let frame = match parse_command_frame(&buffer)? {
-                    Some(frame) => frame,
-                    None => break,
+                let Some(frame) = parse_command_frame(&buffer)? else {
+                    break;
                 };
                 if frame.len > max_frame_size {
                     return Err(anyhow!("frame exceeds max size"));
@@ -462,9 +462,8 @@ where
                 break;
             }
         }
-        let setuser_index = match setuser_index {
-            Some(idx) => idx,
-            None => continue,
+        let Some(setuser_index) = setuser_index else {
+            continue;
         };
         if setuser_index + 1 >= tokens.len() {
             continue;
@@ -478,9 +477,8 @@ where
                 password = Some(rest.to_string());
             }
         }
-        let password = match password {
-            Some(pw) => pw,
-            None => continue,
+        let Some(password) = password else {
+            continue;
         };
 
         if map.contains_key(&user) {
@@ -714,13 +712,12 @@ fn parse_command_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
 }
 
 fn parse_inline_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
-    let line_end = match find_crlf(buf) {
-        Some(pos) => pos,
-        None => return Ok(None),
+    let Some(line_end) = find_crlf(buf) else {
+        return Ok(None);
     };
     let line = &buf[..line_end];
     let mut iter = line
-        .split(|b| b.is_ascii_whitespace())
+        .split(u8::is_ascii_whitespace)
         .filter(|s| !s.is_empty());
     let cmd = iter.next().ok_or_else(|| anyhow!("empty inline command"))?;
     let is_auth = cmd.eq_ignore_ascii_case(b"AUTH");
@@ -732,9 +729,8 @@ fn parse_inline_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
 
 fn parse_array_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
     let mut idx = 1;
-    let line_end = match find_crlf_from(buf, idx) {
-        Some(pos) => pos,
-        None => return Ok(None),
+    let Some(line_end) = find_crlf_from(buf, idx) else {
+        return Ok(None);
     };
     let count = parse_number(&buf[idx..line_end])?;
     if count <= 0 {
@@ -751,15 +747,14 @@ fn parse_array_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
             bail!("unsupported array element type");
         }
         idx += 1;
-        let bulk_len_end = match find_crlf_from(buf, idx) {
-            Some(pos) => pos,
-            None => return Ok(None),
+        let Some(bulk_len_end) = find_crlf_from(buf, idx) else {
+            return Ok(None);
         };
         let bulk_len = parse_number(&buf[idx..bulk_len_end])?;
         if bulk_len < 0 {
             bail!("null bulk not supported for command");
         }
-        let bulk_len = bulk_len as usize;
+        let bulk_len = usize::try_from(bulk_len).context("bulk length too large")?;
         idx = bulk_len_end + 2;
         if idx + bulk_len + 2 > buf.len() {
             return Ok(None);
