@@ -9,6 +9,10 @@ All notable changes to this project will be documented in this file.
 - Demoted downstream TLS handshake EOFs to debug to reduce probe noise.
 - Added reload logging for ACL/TLS watcher events.
 
+## 0.2.1
+
+- Always send AUTH, using `AUTH <user>` when nopass is set.
+
 ## 0.1.0
 
 - Initial release of the mTLS-authenticating DragonflyDB/Redis proxy.
