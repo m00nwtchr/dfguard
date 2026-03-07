@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.2.0
+
+- Breaking: ACL files must use USER list format; ACL SETUSER lines are rejected.
+- Added nopass handling (omitting a password now means no AUTH is sent upstream).
+- Demoted downstream TLS handshake EOFs to debug to reduce probe noise.
+- Added reload logging for ACL/TLS watcher events.
+
 ## 0.1.0
 
 - Initial release of the mTLS-authenticating DragonflyDB/Redis proxy.

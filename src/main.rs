@@ -369,6 +369,7 @@ fn start_acl_watcher(
 
     tokio::spawn(async move {
         while event_rx.recv().await.is_some() {
+            debug!("ACL change detected, reloading");
             tokio::time::sleep(Duration::from_millis(200)).await;
             match load_acl(&path) {
                 Ok(map) => {
@@ -414,6 +415,7 @@ fn start_tls_watcher(
 
     tokio::spawn(async move {
         while event_rx.recv().await.is_some() {
+            debug!("TLS change detected, reloading");
             tokio::time::sleep(Duration::from_millis(200)).await;
             match build_server_config(config.as_ref()) {
                 Ok(server_config) => {
