@@ -5,4 +5,4 @@ metadata:
   namespace: default
 data:
   acl.conf: |
-    ACL SETUSER dfguard ON >dfguard_secret +@all ~*
+    USER dfguard ON >dfguard_secret +@all ~*

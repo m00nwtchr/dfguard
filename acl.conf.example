@@ -1,3 +1,3 @@
 # Example ACL for dfguard
-ACL SETUSER service-a ON >service_a_secret +@all ~*
-ACL SETUSER service-b ON >service_b_secret +@all ~*
+USER service-a ON >service_a_secret +@all ~*
+USER service-b ON >service_b_secret +@all ~*

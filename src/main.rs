@@ -69,6 +69,11 @@ struct ClientConfigs {
     no_resumption: Arc<ClientConfig>,
 }
 
+#[derive(Clone, Debug)]
+struct AclEntry {
+    password: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -129,7 +134,7 @@ async fn handle_connection(
     server_rx: watch::Receiver<Arc<ServerConfig>>,
     client_rx: watch::Receiver<Arc<ClientConfigs>>,
     resumption_enabled: Arc<AtomicBool>,
-    acl_rx: watch::Receiver<Arc<HashMap<String, String>>>,
+    acl_rx: watch::Receiver<Arc<HashMap<String, AclEntry>>>,
     config: Arc<Config>,
 ) -> Result<()> {
     let server_config = server_rx.borrow().clone();
@@ -149,7 +154,7 @@ async fn handle_connection(
 
     let user = extract_dns_user(&tls_stream)?;
     let acl = acl_rx.borrow().clone();
-    let password = acl
+    let entry = acl
         .get(&user)
         .ok_or_else(|| anyhow!("user not found in ACL: {user}"))?
         .clone();
@@ -199,7 +204,9 @@ async fn handle_connection(
         .await?
     };
 
-    send_auth(&mut upstream_tls, &user, &password).await?;
+    if let Some(password) = entry.password.as_deref() {
+        send_auth(&mut upstream_tls, &user, password).await?;
+    }
 
     let (mut downstream_reader, mut downstream_writer) = tokio::io::split(tls_stream);
     let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream_tls);
@@ -338,7 +345,7 @@ fn extract_dns_user(tls: &tokio_rustls::server::TlsStream<TcpStream>) -> Result<
     Ok(dns_names.remove(0))
 }
 
-fn load_acl(path: &Path) -> Result<HashMap<String, String>> {
+fn load_acl(path: &Path) -> Result<HashMap<String, AclEntry>> {
     let file = File::open(path).with_context(|| format!("open ACL file {}", path.display()))?;
     let reader = BufReader::new(file);
     parse_acl_lines(reader.lines())
@@ -346,7 +353,7 @@ fn load_acl(path: &Path) -> Result<HashMap<String, String>> {
 
 fn start_acl_watcher(
     path: PathBuf,
-    acl_tx: watch::Sender<Arc<HashMap<String, String>>>,
+    acl_tx: watch::Sender<Arc<HashMap<String, AclEntry>>>,
 ) -> Result<notify::RecommendedWatcher> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -438,7 +445,7 @@ fn start_tls_watcher(
     Ok(watcher)
 }
 
-fn parse_acl_lines<I>(lines: I) -> Result<HashMap<String, String>>
+fn parse_acl_lines<I>(lines: I) -> Result<HashMap<String, AclEntry>>
 where
     I: Iterator<Item = std::io::Result<String>>,
 {
@@ -459,40 +466,36 @@ where
         }
 
         let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.len() < 4 {
-            continue;
+        if tokens.len() < 2 {
+            bail!("invalid ACL line {}: expected 'USER <name>'", line_num + 1);
         }
-
-        let mut setuser_index = None;
-        for (idx, token) in tokens.iter().enumerate() {
-            if token.eq_ignore_ascii_case("SETUSER") {
-                setuser_index = Some(idx);
-                break;
-            }
+        if !tokens[0].eq_ignore_ascii_case("USER") {
+            bail!(
+                "invalid ACL line {}: only USER entries are supported",
+                line_num + 1
+            );
         }
-        let Some(setuser_index) = setuser_index else {
-            continue;
-        };
-        if setuser_index + 1 >= tokens.len() {
-            continue;
-        }
-        let user = tokens[setuser_index + 1].to_string();
+        let user = tokens[1].to_string();
         let mut password: Option<String> = None;
-        for token in tokens.iter().skip(setuser_index + 2) {
+        let mut saw_nopass = false;
+        for token in tokens.iter().skip(2) {
             if let Some(rest) = token.strip_prefix('>')
                 && !rest.is_empty()
             {
                 password = Some(rest.to_string());
             }
+            if token.eq_ignore_ascii_case("nopass") {
+                saw_nopass = true;
+            }
         }
-        let Some(password) = password else {
-            continue;
-        };
+        if !saw_nopass && password.is_none() {
+            bail!("invalid ACL line {}: missing password", line_num + 1);
+        }
 
         if map.contains_key(&user) {
             bail!("duplicate ACL entry for user {user}");
         }
-        map.insert(user, password);
+        map.insert(user, AclEntry { password });
     }
 
     Ok(map)
@@ -505,18 +508,21 @@ mod tests {
     #[test]
     fn acl_last_password_wins() {
         let input = vec![
-            Ok("ACL SETUSER svc ON >first >second +@all ~*".to_string()),
+            Ok("USER svc ON >first >second +@all ~*".to_string()),
             Ok("# comment".to_string()),
         ];
         let map = parse_acl_lines(input.into_iter()).expect("parse ACL");
-        assert_eq!(map.get("svc").map(String::as_str), Some("second"));
+        assert_eq!(
+            map.get("svc").and_then(|entry| entry.password.as_deref()),
+            Some("second")
+        );
     }
 
     #[test]
     fn acl_duplicate_user_errors() {
         let input = vec![
-            Ok("ACL SETUSER svc ON >one +@all ~*".to_string()),
-            Ok("ACL SETUSER svc ON >two +@all ~*".to_string()),
+            Ok("USER svc ON >one +@all ~*".to_string()),
+            Ok("USER svc ON >two +@all ~*".to_string()),
         ];
         let err = parse_acl_lines(input.into_iter()).expect_err("duplicate user should error");
         assert!(err.to_string().contains("duplicate ACL entry"));
@@ -525,10 +531,20 @@ mod tests {
     #[test]
     fn acl_namespace_token_supported() {
         let input = vec![Ok(
-            "ACL SETUSER user1 NAMESPACE:namespace1 ON >user_pass +@all ~*".to_string(),
+            "USER user1 NAMESPACE:namespace1 ON >user_pass +@all ~*".to_string()
         )];
         let map = parse_acl_lines(input.into_iter()).expect("parse ACL");
-        assert_eq!(map.get("user1").map(String::as_str), Some("user_pass"));
+        assert_eq!(
+            map.get("user1").and_then(|entry| entry.password.as_deref()),
+            Some("user_pass")
+        );
+    }
+
+    #[test]
+    fn acl_rejects_setuser_format() {
+        let input = vec![Ok("ACL SETUSER user1 ON >user_pass +@all ~*".to_string())];
+        let err = parse_acl_lines(input.into_iter()).expect_err("invalid ACL format should error");
+        assert!(err.to_string().contains("only USER entries are supported"));
     }
 }
 

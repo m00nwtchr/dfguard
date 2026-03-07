@@ -52,13 +52,13 @@ cargo build --release
 
 ## ACL format
 
-Lines follow Redis command format. The proxy extracts the user after `SETUSER` and the last password token starting with `>`.
+Lines follow Redis ACL list format. The proxy extracts the user after `USER` and the last password token starting with `>`.
 
 Example:
 
 ```text
-ACL SETUSER service-a ON >service_a_secret +@all ~*
-ACL SETUSER user1 NAMESPACE:namespace1 ON >user_pass +@all ~*
+USER service-a ON >service_a_secret +@all ~*
+USER user1 NAMESPACE:namespace1 ON >user_pass +@all ~*
 ```
 
 Duplicate users are rejected. Comments with `#` are ignored.
