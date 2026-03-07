@@ -204,9 +204,7 @@ async fn handle_connection(
         .await?
     };
 
-    if let Some(password) = entry.password.as_deref() {
-        send_auth(&mut upstream_tls, &user, password).await?;
-    }
+    send_auth(&mut upstream_tls, &user, entry.password.as_deref()).await?;
 
     let (mut downstream_reader, mut downstream_writer) = tokio::io::split(tls_stream);
     let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream_tls);
@@ -682,7 +680,7 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 async fn send_auth(
     upstream: &mut tokio_rustls::client::TlsStream<TcpStream>,
     user: &str,
-    password: &str,
+    password: Option<&str>,
 ) -> Result<()> {
     let payload = build_auth_command(user, password);
     upstream.write_all(&payload).await?;
@@ -709,13 +707,24 @@ async fn send_auth(
     }
 }
 
-fn build_auth_command(user: &str, password: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + user.len() + password.len());
-    out.extend_from_slice(b"*3\r\n");
-    push_bulk(&mut out, b"AUTH");
-    push_bulk(&mut out, user.as_bytes());
-    push_bulk(&mut out, password.as_bytes());
-    out
+fn build_auth_command(user: &str, password: Option<&str>) -> Vec<u8> {
+    match password {
+        Some(password) => {
+            let mut out = Vec::with_capacity(64 + user.len() + password.len());
+            out.extend_from_slice(b"*3\r\n");
+            push_bulk(&mut out, b"AUTH");
+            push_bulk(&mut out, user.as_bytes());
+            push_bulk(&mut out, password.as_bytes());
+            out
+        }
+        None => {
+            let mut out = Vec::with_capacity(48 + user.len());
+            out.extend_from_slice(b"*2\r\n");
+            push_bulk(&mut out, b"AUTH");
+            push_bulk(&mut out, user.as_bytes());
+            out
+        }
+    }
 }
 
 fn push_bulk(out: &mut Vec<u8>, data: &[u8]) {
