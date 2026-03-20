@@ -20,7 +20,7 @@ use rustls::pki_types::{
 use rustls::{AlertDescription, ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, error, info};
@@ -59,6 +59,9 @@ struct Config {
     #[arg(long, default_value = "16777216")]
     max_frame_size: usize,
 
+    #[arg(long, default_value = "64")]
+    pool_max_idle_per_user: usize,
+
     #[arg(long, default_value_t = false)]
     insecure_upstream: bool,
 }
@@ -72,6 +75,59 @@ struct ClientConfigs {
 #[derive(Clone, Debug)]
 struct AclEntry {
     password: Option<String>,
+}
+
+#[derive(Clone)]
+struct UpstreamPool {
+    idle: Arc<Mutex<HashMap<PoolKey, Vec<UpstreamConn>>>>,
+    upstream_addr: SocketAddr,
+    server_name: ServerName<'static>,
+    handshake_timeout: Duration,
+    max_idle_per_user: usize,
+    client_rx: watch::Receiver<Arc<ClientConfigs>>,
+    resumption_enabled: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct PoolKey {
+    user: String,
+}
+
+struct UpstreamConn {
+    tls: tokio_rustls::client::TlsStream<TcpStream>,
+    read_buf: BytesMut,
+}
+
+#[derive(Default)]
+struct PinnedState {
+    in_multi: bool,
+    watch_active: bool,
+    tracking_on: bool,
+    pin_forever: bool,
+    blocking_in_flight: bool,
+}
+
+impl PinnedState {
+    fn can_unpin(&self) -> bool {
+        !self.in_multi
+            && !self.watch_active
+            && !self.tracking_on
+            && !self.pin_forever
+            && !self.blocking_in_flight
+    }
+}
+
+struct PinnedConn {
+    conn: UpstreamConn,
+    state: PinnedState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandClass {
+    Stateless,
+    PinTemporary,
+    PinForever,
+    PinWhileBlocking,
 }
 
 #[tokio::main]
@@ -93,6 +149,20 @@ async fn main() -> Result<()> {
     let (server_tx, server_rx) = watch::channel(server_config);
     let (client_tx, client_rx) = watch::channel(client_configs);
     let resumption_enabled = Arc::new(AtomicBool::new(true));
+    let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
+
+    let (upstream_host, _upstream_port) = parse_host_port(&config.upstream)?;
+    let upstream_addr = resolve_addr(&config.upstream)?;
+    let server_name = parse_server_name(&upstream_host)?;
+    let upstream_pool = Arc::new(UpstreamPool {
+        idle: Arc::new(Mutex::new(HashMap::new())),
+        upstream_addr,
+        server_name,
+        handshake_timeout,
+        max_idle_per_user: config.pool_max_idle_per_user,
+        client_rx: client_rx.clone(),
+        resumption_enabled: resumption_enabled.clone(),
+    });
 
     let listener = TcpListener::bind(&config.listen)
         .await
@@ -107,20 +177,12 @@ async fn main() -> Result<()> {
     loop {
         let (socket, _) = listener.accept().await?;
         let server_rx = server_rx.clone();
-        let client_rx = client_rx.clone();
-        let resumption_enabled = resumption_enabled.clone();
         let acl_rx = acl_rx.clone();
+        let upstream_pool = upstream_pool.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(
-                socket,
-                server_rx,
-                client_rx,
-                resumption_enabled,
-                acl_rx,
-                config,
-            )
-            .await
+            if let Err(err) =
+                handle_connection(socket, server_rx, acl_rx, config, upstream_pool).await
             {
                 error!("connection error: {err:#}");
             }
@@ -132,14 +194,14 @@ async fn main() -> Result<()> {
 async fn handle_connection(
     socket: TcpStream,
     server_rx: watch::Receiver<Arc<ServerConfig>>,
-    client_rx: watch::Receiver<Arc<ClientConfigs>>,
-    resumption_enabled: Arc<AtomicBool>,
     acl_rx: watch::Receiver<Arc<HashMap<String, AclEntry>>>,
     config: Arc<Config>,
+    upstream_pool: Arc<UpstreamPool>,
 ) -> Result<()> {
     let server_config = server_rx.borrow().clone();
     let acceptor = TlsAcceptor::from(server_config);
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
+    let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
     let tls_stream = match timeout(handshake_timeout, acceptor.accept(socket)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => {
@@ -159,128 +221,149 @@ async fn handle_connection(
         .ok_or_else(|| anyhow!("user not found in ACL: {user}"))?
         .clone();
 
-    let (upstream_host, _upstream_port) = parse_host_port(&config.upstream)?;
-    let upstream_addr = resolve_addr(&config.upstream)?;
-    let server_name = parse_server_name(&upstream_host)?;
-    let client_configs = client_rx.borrow().clone();
-    let connector = TlsConnector::from(client_configs.with_resumption.clone());
-    let connector_no_resumption = TlsConnector::from(client_configs.no_resumption.clone());
-
-    let mut upstream_tls = if resumption_enabled.load(Ordering::Relaxed) {
-        match connect_upstream(
-            &connector,
-            upstream_addr,
-            server_name.clone(),
-            handshake_timeout,
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(err) => {
-                if should_retry_without_resumption(&err) {
-                    info!("upstream TLS resumption failed, retrying without resumption");
-                    let stream = connect_upstream(
-                        &connector_no_resumption,
-                        upstream_addr,
-                        server_name,
-                        handshake_timeout,
-                    )
-                    .await?;
-                    resumption_enabled.store(false, Ordering::Relaxed);
-                    info!("upstream TLS resumption disabled for future connections");
-                    stream
-                } else {
-                    return Err(err);
-                }
-            }
-        }
-    } else {
-        connect_upstream(
-            &connector_no_resumption,
-            upstream_addr,
-            server_name,
-            handshake_timeout,
-        )
-        .await?
-    };
-
-    send_auth(&mut upstream_tls, &user, entry.password.as_deref()).await?;
-
-    let (mut downstream_reader, mut downstream_writer) = tokio::io::split(tls_stream);
-    let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream_tls);
-
-    let (err_tx, mut err_rx) = mpsc::channel::<Vec<u8>>(8);
-    let err_tx_client = err_tx.clone();
-    let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
+    let key = PoolKey { user };
+    let password = entry.password;
+    let mut downstream = tls_stream;
+    let mut downstream_buf = BytesMut::with_capacity(8192);
+    let mut pinned: Option<PinnedConn> = None;
     let max_frame_size = config.max_frame_size;
 
-    let upstream_to_downstream = tokio::spawn(async move {
-        let mut buffer = vec![0u8; 8192];
-        loop {
-            tokio::select! {
-                read_res = timeout(idle_timeout, upstream_reader.read(&mut buffer)) => {
-                    let n = match read_res {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(err)) => return Err(anyhow!(err)),
-                        Err(_) => return Err(anyhow!("upstream idle timeout")),
-                    };
-                    if n == 0 {
-                        return Ok(());
-                    }
-                    downstream_writer.write_all(&buffer[..n]).await?;
-                }
-                msg = err_rx.recv() => {
-                    if let Some(payload) = msg {
-                        downstream_writer.write_all(&payload).await?;
-                    }
-                }
+    loop {
+        let Some((frame, data)) = read_next_command_frame(
+            &mut downstream,
+            &mut downstream_buf,
+            idle_timeout,
+            max_frame_size,
+        )
+        .await?
+        else {
+            if let Some(pinned_conn) = pinned.take()
+                && pinned_conn.state.can_unpin()
+            {
+                upstream_pool.release(&key, pinned_conn.conn).await;
             }
+            return Ok(());
+        };
+
+        if frame.is_auth {
+            downstream
+                .write_all(b"-ERR AUTH disabled by proxy\r\n")
+                .await?;
+            continue;
         }
-    });
 
-    let client_to_upstream = async move {
-        let mut buffer = BytesMut::with_capacity(8192);
-        let mut read_buf = [0u8; 8192];
-        loop {
-            let n = match timeout(idle_timeout, downstream_reader.read(&mut read_buf)).await {
-                Ok(Ok(n)) => n,
-                Ok(Err(err)) => return Err(anyhow!(err)),
-                Err(_) => return Err(anyhow!("downstream idle timeout")),
-            };
-            if n == 0 {
-                return Ok(());
-            }
-            buffer.extend_from_slice(&read_buf[..n]);
-            if buffer.len() > max_frame_size {
-                return Err(anyhow!("frame buffer exceeds max size"));
-            }
-
-            loop {
-                let Some(frame) = parse_command_frame(&buffer)? else {
-                    break;
-                };
-                if frame.len > max_frame_size {
-                    return Err(anyhow!("frame exceeds max size"));
-                }
-                let data = buffer.split_to(frame.len);
-                if frame.is_auth {
-                    let _ = err_tx_client
-                        .send(b"-ERR AUTH disabled by proxy\r\n".to_vec())
-                        .await;
-                } else {
-                    upstream_writer.write_all(&data).await?;
-                }
-            }
+        let class = classify_command(&frame);
+        if pinned.is_none()
+            && matches!(
+                class,
+                CommandClass::PinTemporary
+                    | CommandClass::PinForever
+                    | CommandClass::PinWhileBlocking
+            )
+        {
+            let conn = upstream_pool.checkout(&key, password.as_deref()).await?;
+            pinned = Some(PinnedConn {
+                conn,
+                state: PinnedState::default(),
+            });
         }
-    };
 
-    let client_to_upstream_result = client_to_upstream.await;
-    drop(err_tx);
-    let upstream_to_downstream_result = upstream_to_downstream.await;
+        if let Some(pinned_conn) = pinned.as_mut() {
+            apply_command_state_before_send(&mut pinned_conn.state, &frame, class);
+            pinned_conn.conn.tls.write_all(&data).await?;
+            let response =
+                read_upstream_response(&mut pinned_conn.conn, idle_timeout, max_frame_size).await?;
+            downstream.write_all(&response).await?;
+            apply_command_state_after_response(&mut pinned_conn.state, &frame, class, &response);
 
-    client_to_upstream_result?;
-    upstream_to_downstream_result??;
-    Ok(())
+            if pinned_conn.state.can_unpin() {
+                let pinned_conn = pinned.take().expect("pinned state present");
+                upstream_pool.release(&key, pinned_conn.conn).await;
+            }
+            continue;
+        }
+
+        let mut conn = upstream_pool.checkout(&key, password.as_deref()).await?;
+        conn.tls.write_all(&data).await?;
+        let response = read_upstream_response(&mut conn, idle_timeout, max_frame_size).await?;
+        downstream.write_all(&response).await?;
+        upstream_pool.release(&key, conn).await;
+    }
+}
+
+impl UpstreamPool {
+    async fn checkout(&self, key: &PoolKey, password: Option<&str>) -> Result<UpstreamConn> {
+        if let Some(conn) = {
+            let mut idle = self.idle.lock().await;
+            idle.get_mut(key).and_then(Vec::pop)
+        } {
+            return Ok(conn);
+        }
+        self.connect_new(key, password).await
+    }
+
+    async fn release(&self, key: &PoolKey, conn: UpstreamConn) {
+        if !conn.read_buf.is_empty() {
+            return;
+        }
+
+        let mut idle = self.idle.lock().await;
+        let entry = idle.entry(key.clone()).or_default();
+        if entry.len() < self.max_idle_per_user {
+            entry.push(conn);
+        }
+    }
+
+    async fn connect_new(&self, key: &PoolKey, password: Option<&str>) -> Result<UpstreamConn> {
+        let client_configs = self.client_rx.borrow().clone();
+        let connector = TlsConnector::from(client_configs.with_resumption.clone());
+        let connector_no_resumption = TlsConnector::from(client_configs.no_resumption.clone());
+
+        let mut upstream_tls = if self.resumption_enabled.load(Ordering::Relaxed) {
+            match connect_upstream(
+                &connector,
+                self.upstream_addr,
+                self.server_name.clone(),
+                self.handshake_timeout,
+            )
+            .await
+            {
+                Ok(stream) => stream,
+                Err(err) => {
+                    if should_retry_without_resumption(&err) {
+                        info!("upstream TLS resumption failed, retrying without resumption");
+                        let stream = connect_upstream(
+                            &connector_no_resumption,
+                            self.upstream_addr,
+                            self.server_name.clone(),
+                            self.handshake_timeout,
+                        )
+                        .await?;
+                        self.resumption_enabled.store(false, Ordering::Relaxed);
+                        info!("upstream TLS resumption disabled for future connections");
+                        stream
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        } else {
+            connect_upstream(
+                &connector_no_resumption,
+                self.upstream_addr,
+                self.server_name.clone(),
+                self.handshake_timeout,
+            )
+            .await?
+        };
+
+        send_auth(&mut upstream_tls, &key.user, password).await?;
+
+        Ok(UpstreamConn {
+            tls: upstream_tls,
+            read_buf: BytesMut::with_capacity(1024),
+        })
+    }
 }
 
 fn parse_host_port(input: &str) -> Result<(String, u16)> {
@@ -503,7 +586,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::parse_acl_lines;
+    use super::{
+        CommandClass, FrameInfo, PinnedState, apply_command_state_after_response,
+        apply_command_state_before_send, classify_command, parse_acl_lines,
+    };
 
     #[test]
     fn acl_last_password_wins() {
@@ -545,6 +631,63 @@ mod tests {
         let input = vec![Ok("ACL SETUSER user1 ON >user_pass +@all ~*".to_string())];
         let err = parse_acl_lines(input.into_iter()).expect_err("invalid ACL format should error");
         assert!(err.to_string().contains("only USER entries are supported"));
+    }
+
+    #[test]
+    fn classify_tracking_on_pins_temporarily() {
+        let frame = FrameInfo {
+            len: 0,
+            is_auth: false,
+            command: "CLIENT".to_string(),
+            args: vec!["TRACKING".to_string(), "ON".to_string()],
+        };
+        assert_eq!(classify_command(&frame), CommandClass::PinTemporary);
+    }
+
+    #[test]
+    fn classify_xread_block_pins_while_blocking() {
+        let frame = FrameInfo {
+            len: 0,
+            is_auth: false,
+            command: "XREAD".to_string(),
+            args: vec!["BLOCK".to_string(), "5000".to_string()],
+        };
+        assert_eq!(classify_command(&frame), CommandClass::PinWhileBlocking);
+    }
+
+    #[test]
+    fn unpin_after_exec_clears_transaction_state() {
+        let mut state = PinnedState::default();
+        let multi = FrameInfo {
+            len: 0,
+            is_auth: false,
+            command: "MULTI".to_string(),
+            args: vec![],
+        };
+        let exec = FrameInfo {
+            len: 0,
+            is_auth: false,
+            command: "EXEC".to_string(),
+            args: vec![],
+        };
+
+        apply_command_state_before_send(&mut state, &multi, CommandClass::PinTemporary);
+        apply_command_state_after_response(
+            &mut state,
+            &multi,
+            CommandClass::PinTemporary,
+            b"+OK\r\n",
+        );
+        assert!(!state.can_unpin());
+
+        apply_command_state_before_send(&mut state, &exec, CommandClass::PinTemporary);
+        apply_command_state_after_response(
+            &mut state,
+            &exec,
+            CommandClass::PinTemporary,
+            b"*0\r\n",
+        );
+        assert!(state.can_unpin());
     }
 }
 
@@ -756,9 +899,13 @@ fn parse_inline_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
         .filter(|s| !s.is_empty());
     let cmd = iter.next().ok_or_else(|| anyhow!("empty inline command"))?;
     let is_auth = cmd.eq_ignore_ascii_case(b"AUTH");
+    let command = to_upper_ascii_string(cmd);
+    let args = iter.take(8).map(to_upper_ascii_string).collect();
     Ok(Some(FrameInfo {
         len: line_end + 2,
         is_auth,
+        command,
+        args,
     }))
 }
 
@@ -774,6 +921,8 @@ fn parse_array_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
     idx = line_end + 2;
 
     let mut is_auth = false;
+    let mut command = String::new();
+    let mut args = Vec::new();
     for i in 0..count {
         if idx >= buf.len() {
             return Ok(None);
@@ -797,11 +946,231 @@ fn parse_array_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
         if i == 0 {
             let cmd = &buf[idx..idx + bulk_len];
             is_auth = cmd.eq_ignore_ascii_case(b"AUTH");
+            command = to_upper_ascii_string(cmd);
+        } else if args.len() < 8 {
+            args.push(to_upper_ascii_string(&buf[idx..idx + bulk_len]));
         }
         idx += bulk_len + 2;
     }
 
-    Ok(Some(FrameInfo { len: idx, is_auth }))
+    Ok(Some(FrameInfo {
+        len: idx,
+        is_auth,
+        command,
+        args,
+    }))
+}
+
+fn to_upper_ascii_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_ascii_uppercase()
+}
+
+async fn read_next_command_frame(
+    downstream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    buffer: &mut BytesMut,
+    idle_timeout: Duration,
+    max_frame_size: usize,
+) -> Result<Option<(FrameInfo, Vec<u8>)>> {
+    let mut read_buf = [0u8; 8192];
+    loop {
+        if let Some(frame) = parse_command_frame(buffer)? {
+            if frame.len > max_frame_size {
+                bail!("frame exceeds max size");
+            }
+            let data = buffer.split_to(frame.len).to_vec();
+            return Ok(Some((frame, data)));
+        }
+
+        let n = match timeout(idle_timeout, downstream.read(&mut read_buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(anyhow!(err)),
+            Err(_) => return Err(anyhow!("downstream idle timeout")),
+        };
+
+        if n == 0 {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            bail!("downstream closed with partial frame");
+        }
+
+        buffer.extend_from_slice(&read_buf[..n]);
+        if buffer.len() > max_frame_size {
+            bail!("frame buffer exceeds max size");
+        }
+    }
+}
+
+async fn read_upstream_response(
+    upstream: &mut UpstreamConn,
+    idle_timeout: Duration,
+    max_frame_size: usize,
+) -> Result<Vec<u8>> {
+    let mut read_buf = [0u8; 8192];
+    loop {
+        if let Some(len) = parse_resp_frame_len(&upstream.read_buf)? {
+            if len > max_frame_size {
+                bail!("response frame exceeds max size");
+            }
+            return Ok(upstream.read_buf.split_to(len).to_vec());
+        }
+
+        let n = match timeout(idle_timeout, upstream.tls.read(&mut read_buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => return Err(anyhow!(err)),
+            Err(_) => return Err(anyhow!("upstream idle timeout")),
+        };
+
+        if n == 0 {
+            bail!("upstream closed connection");
+        }
+
+        upstream.read_buf.extend_from_slice(&read_buf[..n]);
+        if upstream.read_buf.len() > max_frame_size {
+            bail!("response buffer exceeds max size");
+        }
+    }
+}
+
+fn parse_resp_frame_len(buf: &[u8]) -> Result<Option<usize>> {
+    parse_resp_frame_len_from(buf, 0)
+}
+
+fn parse_resp_frame_len_from(buf: &[u8], start: usize) -> Result<Option<usize>> {
+    if start >= buf.len() {
+        return Ok(None);
+    }
+
+    match buf[start] {
+        b'+' | b'-' | b':' => {
+            let Some(line_end) = find_crlf_from(buf, start + 1) else {
+                return Ok(None);
+            };
+            Ok(Some(line_end + 2 - start))
+        }
+        b'$' => {
+            let Some(line_end) = find_crlf_from(buf, start + 1) else {
+                return Ok(None);
+            };
+            let bulk_len = parse_number(&buf[start + 1..line_end])?;
+            if bulk_len == -1 {
+                return Ok(Some(line_end + 2 - start));
+            }
+            if bulk_len < -1 {
+                bail!("invalid bulk length");
+            }
+            let bulk_len = usize::try_from(bulk_len).context("bulk length too large")?;
+            let total = line_end + 2 + bulk_len + 2;
+            if total > buf.len() {
+                return Ok(None);
+            }
+            Ok(Some(total - start))
+        }
+        b'*' => {
+            let Some(line_end) = find_crlf_from(buf, start + 1) else {
+                return Ok(None);
+            };
+            let count = parse_number(&buf[start + 1..line_end])?;
+            if count == -1 {
+                return Ok(Some(line_end + 2 - start));
+            }
+            if count < -1 {
+                bail!("invalid array length");
+            }
+            let mut idx = line_end + 2;
+            let count = usize::try_from(count).context("array length too large")?;
+            for _ in 0..count {
+                let Some(next_len) = parse_resp_frame_len_from(buf, idx)? else {
+                    return Ok(None);
+                };
+                idx += next_len;
+            }
+            Ok(Some(idx - start))
+        }
+        _ => bail!("unsupported RESP response type"),
+    }
+}
+
+fn classify_command(frame: &FrameInfo) -> CommandClass {
+    let cmd = frame.command.as_str();
+    match cmd {
+        "MULTI" | "WATCH" | "UNWATCH" | "EXEC" | "DISCARD" | "RESET" => CommandClass::PinTemporary,
+        "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" | "MONITOR" | "SELECT" => {
+            CommandClass::PinForever
+        }
+        "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "BZPOPMIN" | "BZPOPMAX" => {
+            CommandClass::PinWhileBlocking
+        }
+        "CLIENT" if frame.args.first().is_some_and(|arg| arg == "TRACKING") => {
+            CommandClass::PinTemporary
+        }
+        "XREAD" | "XREADGROUP" if frame.args.iter().any(|arg| arg == "BLOCK") => {
+            CommandClass::PinWhileBlocking
+        }
+        _ => CommandClass::Stateless,
+    }
+}
+
+fn apply_command_state_before_send(
+    state: &mut PinnedState,
+    frame: &FrameInfo,
+    class: CommandClass,
+) {
+    let _ = frame;
+    match class {
+        CommandClass::PinWhileBlocking => state.blocking_in_flight = true,
+        CommandClass::Stateless | CommandClass::PinTemporary | CommandClass::PinForever => {}
+    }
+}
+
+fn apply_command_state_after_response(
+    state: &mut PinnedState,
+    frame: &FrameInfo,
+    class: CommandClass,
+    response: &[u8],
+) {
+    if matches!(class, CommandClass::PinWhileBlocking) && !response.is_empty() {
+        state.blocking_in_flight = false;
+    }
+
+    if response.first().copied() == Some(b'-') {
+        return;
+    }
+
+    let cmd = frame.command.as_str();
+    match class {
+        CommandClass::PinForever => state.pin_forever = true,
+        CommandClass::PinWhileBlocking | CommandClass::PinTemporary | CommandClass::Stateless => {}
+    }
+
+    match cmd {
+        "MULTI" => state.in_multi = true,
+        "WATCH" => state.watch_active = true,
+        "UNWATCH" => state.watch_active = false,
+        "EXEC" | "DISCARD" => {
+            state.in_multi = false;
+            state.watch_active = false;
+        }
+        "CLIENT"
+            if frame.args.first().is_some_and(|arg| arg == "TRACKING")
+                && frame.args.get(1).is_some_and(|arg| arg == "ON") =>
+        {
+            state.tracking_on = true;
+        }
+        "CLIENT"
+            if frame.args.first().is_some_and(|arg| arg == "TRACKING")
+                && frame.args.get(1).is_some_and(|arg| arg == "OFF") =>
+        {
+            state.tracking_on = false;
+        }
+        "RESET" => {
+            state.in_multi = false;
+            state.watch_active = false;
+            state.tracking_on = false;
+            state.blocking_in_flight = false;
+        }
+        _ => {}
+    }
 }
 
 fn parse_number(slice: &[u8]) -> Result<i64> {
@@ -828,6 +1197,8 @@ fn find_crlf_from(buf: &[u8], start: usize) -> Option<usize> {
 struct FrameInfo {
     len: usize,
     is_auth: bool,
+    command: String,
+    args: Vec<String>,
 }
 
 async fn connect_upstream(

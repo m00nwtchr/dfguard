@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- Added upstream TLS connection pooling keyed by authenticated user identity.
+- Added command-aware pinning for stateful Redis flows, including transaction/blocking/tracking detection.
+- Added automatic unpinning for temporary state after reset commands (for example, `EXEC`, `DISCARD`, `UNWATCH`, `CLIENT TRACKING OFF`).
+
 ## 0.2.0
 
 - Breaking: ACL files must use USER list format; ACL SETUSER lines are rejected.

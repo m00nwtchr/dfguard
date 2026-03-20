@@ -8,6 +8,8 @@ Minimal mTLS-authenticating proxy for DragonflyDB/Redis.
 - Connects upstream to DragonflyDB using its own mTLS client cert.
 - Automatically sends `AUTH <user> <password>` based on `acl.conf`.
 - Blocks `AUTH` commands from downstream clients.
+- Uses upstream TLS connection pooling keyed by user.
+- Pins connections for stateful commands and unpins when state is cleared (for example, `EXEC`/`DISCARD`/`UNWATCH` and `CLIENT TRACKING OFF`).
 
 ## Requirements
 
@@ -74,4 +76,5 @@ The ACL file is watched with inotify (via `notify`) and reloaded on changes.
 ## Notes
 
 - The proxy is minimally invasive: it only injects initial `AUTH` and blocks downstream `AUTH`.
+- Stateful commands (for example, `SUBSCRIBE`, `MONITOR`, and `SELECT`) keep a connection pinned for the lifetime of that downstream session.
 - Secrets are never logged.
