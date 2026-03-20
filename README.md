@@ -52,6 +52,31 @@ cargo build --release
   --upstream-ca /path/to/upstream-ca.crt
 ```
 
+You can also configure all options via environment variables:
+
+```bash
+DFGUARD_LISTEN=0.0.0.0:6380
+DFGUARD_UPSTREAM=dragonfly.example:6379
+DFGUARD_ACL=/path/to/acl.conf
+DFGUARD_SERVER_CERT=/path/to/server.crt
+DFGUARD_SERVER_KEY=/path/to/server.key
+DFGUARD_SERVER_CA=/path/to/server-ca.crt
+DFGUARD_UPSTREAM_CERT=/path/to/upstream.crt
+DFGUARD_UPSTREAM_KEY=/path/to/upstream.key
+DFGUARD_UPSTREAM_CA=/path/to/upstream-ca.crt
+./target/release/dfguard
+```
+
+Optional env vars:
+
+- `DFGUARD_HANDSHAKE_TIMEOUT_SECS` (default `10`)
+- `DFGUARD_IDLE_TIMEOUT_SECS` (default `300`)
+- `DFGUARD_MAX_FRAME_SIZE` (default `16777216`)
+- `DFGUARD_POOL_MAX_IDLE_PER_USER` (default `64`)
+- `DFGUARD_INSECURE_UPSTREAM` (default `false`)
+
+CLI flags override environment variables.
+
 ## ACL format
 
 Lines follow Redis ACL list format. The proxy extracts the user after `USER` and the last password token starting with `>`.

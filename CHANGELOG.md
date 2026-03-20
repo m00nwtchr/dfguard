@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Added environment-variable based configuration for all runtime options (`DFGUARD_*`).
+
 ## 0.2.3
 
 - Added RESP3 response frame support in upstream parsing to prevent false "unsupported RESP response type" errors.

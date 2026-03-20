@@ -10,7 +10,7 @@ repository = "https://github.com/m00nwtchr/dfguard"
 [dependencies]
 anyhow = "1"
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 notify = "6"
 pem = "3"
 rustls = "0.23"

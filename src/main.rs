@@ -31,38 +31,38 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 #[derive(Parser, Debug, Clone)]
 #[command(name = "dfguard", version, about = "mTLS auth proxy for DragonflyDB")]
 struct Config {
-    #[arg(long)]
+    #[arg(long, env = "DFGUARD_LISTEN")]
     listen: String,
-    #[arg(long)]
+    #[arg(long, env = "DFGUARD_UPSTREAM")]
     upstream: String,
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_ACL")]
     acl: PathBuf,
 
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_SERVER_CERT")]
     server_cert: PathBuf,
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_SERVER_KEY")]
     server_key: PathBuf,
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_SERVER_CA")]
     server_ca: PathBuf,
 
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_UPSTREAM_CERT")]
     upstream_cert: PathBuf,
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_UPSTREAM_KEY")]
     upstream_key: PathBuf,
-    #[arg(long, value_name = "FILE")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_UPSTREAM_CA")]
     upstream_ca: PathBuf,
 
-    #[arg(long, default_value = "10")]
+    #[arg(long, env = "DFGUARD_HANDSHAKE_TIMEOUT_SECS", default_value = "10")]
     handshake_timeout_secs: u64,
-    #[arg(long, default_value = "300")]
+    #[arg(long, env = "DFGUARD_IDLE_TIMEOUT_SECS", default_value = "300")]
     idle_timeout_secs: u64,
-    #[arg(long, default_value = "16777216")]
+    #[arg(long, env = "DFGUARD_MAX_FRAME_SIZE", default_value = "16777216")]
     max_frame_size: usize,
 
-    #[arg(long, default_value = "64")]
+    #[arg(long, env = "DFGUARD_POOL_MAX_IDLE_PER_USER", default_value = "64")]
     pool_max_idle_per_user: usize,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, env = "DFGUARD_INSECURE_UPSTREAM", default_value_t = false)]
     insecure_upstream: bool,
 }
 
