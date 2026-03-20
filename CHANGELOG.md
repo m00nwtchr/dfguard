@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.6
+
+- Avoid initializing OTEL exporters when no OTLP endpoint is configured.
+
 ## 0.2.5
 
 - Added OpenTelemetry traces, logs, and metrics export support over OTLP gRPC.
