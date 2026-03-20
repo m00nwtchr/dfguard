@@ -478,10 +478,12 @@ fn init_telemetry(config: &Config, filter: EnvFilter, telemetry: &mut Telemetry)
     let mut meter_provider = None;
     let mut logger_provider = None;
 
-    if std::env::var("OTEL_SDK_DISABLED")
+    let sdk_disabled = std::env::var("OTEL_SDK_DISABLED")
         .map(|v| v == "true")
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let otlp_configured = has_otel_otlp_endpoint_env();
+
+    if sdk_disabled || !otlp_configured {
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().with_target(false))
@@ -568,6 +570,21 @@ fn init_telemetry(config: &Config, filter: EnvFilter, telemetry: &mut Telemetry)
         _meter: meter_provider,
         _logger: logger_provider,
     }
+}
+
+fn has_otel_otlp_endpoint_env() -> bool {
+    [
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var(name)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn build_otel_metrics(meter: &Meter) -> OTelMetrics {
