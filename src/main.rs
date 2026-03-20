@@ -99,27 +99,67 @@ struct UpstreamConn {
 }
 
 #[derive(Default)]
-struct PinnedState {
-    in_multi: bool,
-    watch_active: bool,
-    tracking_on: bool,
-    pin_forever: bool,
-    blocking_in_flight: bool,
+struct SessionState {
+    txn: TxnState,
+    watch: WatchState,
+    tracking: TrackingState,
+    blocking: BlockingState,
+    sticky: StickyState,
 }
 
-impl PinnedState {
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum TxnState {
+    #[default]
+    None,
+    InMulti,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum WatchState {
+    #[default]
+    Off,
+    On,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum TrackingState {
+    #[default]
+    Off,
+    On,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum BlockingState {
+    #[default]
+    Idle,
+    Waiting,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum StickyState {
+    #[default]
+    Off,
+    On,
+}
+
+impl SessionState {
     fn can_unpin(&self) -> bool {
-        !self.in_multi
-            && !self.watch_active
-            && !self.tracking_on
-            && !self.pin_forever
-            && !self.blocking_in_flight
+        self.txn == TxnState::None
+            && self.watch == WatchState::Off
+            && self.tracking == TrackingState::Off
+            && self.sticky == StickyState::Off
+            && self.blocking == BlockingState::Idle
     }
 }
 
 struct PinnedConn {
     conn: UpstreamConn,
-    state: PinnedState,
+    state: SessionState,
+}
+
+enum RouteState {
+    Stateless,
+    Pinned(Box<PinnedConn>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,7 +265,7 @@ async fn handle_connection(
     let password = entry.password;
     let mut downstream = tls_stream;
     let mut downstream_buf = BytesMut::with_capacity(8192);
-    let mut pinned: Option<PinnedConn> = None;
+    let mut route_state = RouteState::Stateless;
     let max_frame_size = config.max_frame_size;
 
     loop {
@@ -237,9 +277,16 @@ async fn handle_connection(
         )
         .await?
         else {
-            if let Some(pinned_conn) = pinned.take()
-                && pinned_conn.state.can_unpin()
-            {
+            let should_release = match &route_state {
+                RouteState::Pinned(pinned_conn) => pinned_conn.state.can_unpin(),
+                RouteState::Stateless => false,
+            };
+            if should_release {
+                let RouteState::Pinned(pinned_conn) =
+                    std::mem::replace(&mut route_state, RouteState::Stateless)
+                else {
+                    unreachable!("release checked pinned state");
+                };
                 upstream_pool.release(&key, pinned_conn.conn).await;
             }
             return Ok(());
@@ -253,7 +300,7 @@ async fn handle_connection(
         }
 
         let class = classify_command(&frame);
-        if pinned.is_none()
+        if matches!(route_state, RouteState::Stateless)
             && matches!(
                 class,
                 CommandClass::PinTemporary
@@ -262,13 +309,13 @@ async fn handle_connection(
             )
         {
             let conn = upstream_pool.checkout(&key, password.as_deref()).await?;
-            pinned = Some(PinnedConn {
+            route_state = RouteState::Pinned(Box::new(PinnedConn {
                 conn,
-                state: PinnedState::default(),
-            });
+                state: SessionState::default(),
+            }));
         }
 
-        if let Some(pinned_conn) = pinned.as_mut() {
+        if let RouteState::Pinned(pinned_conn) = &mut route_state {
             apply_command_state_before_send(&mut pinned_conn.state, &frame, class);
             pinned_conn.conn.tls.write_all(&data).await?;
             let response =
@@ -276,8 +323,28 @@ async fn handle_connection(
             downstream.write_all(&response).await?;
             apply_command_state_after_response(&mut pinned_conn.state, &frame, class, &response);
 
+            if should_reauth_after_reset(&frame, &response)
+                && let Err(err) =
+                    send_auth(&mut pinned_conn.conn.tls, &key.user, password.as_deref()).await
+            {
+                let RouteState::Pinned(_dropped_conn) =
+                    std::mem::replace(&mut route_state, RouteState::Stateless)
+                else {
+                    unreachable!("state just matched pinned");
+                };
+                error!("upstream re-authentication after RESET failed: {err:#}");
+                downstream
+                    .write_all(b"-ERR proxy failed to reauthenticate upstream after RESET\r\n")
+                    .await?;
+                continue;
+            }
+
             if pinned_conn.state.can_unpin() {
-                let pinned_conn = pinned.take().expect("pinned state present");
+                let RouteState::Pinned(pinned_conn) =
+                    std::mem::replace(&mut route_state, RouteState::Stateless)
+                else {
+                    unreachable!("state just matched pinned");
+                };
                 upstream_pool.release(&key, pinned_conn.conn).await;
             }
             continue;
@@ -587,9 +654,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandClass, FrameInfo, PinnedState, apply_command_state_after_response,
-        apply_command_state_before_send, classify_command, parse_acl_lines,
+        CommandClass, FrameInfo, SessionState, apply_command_state_after_response,
+        apply_command_state_before_send, classify_command, parse_acl_lines, parse_resp_frame_len,
+        should_reauth_after_reset,
     };
+
+    fn frame(command: &str, args: &[&str]) -> FrameInfo {
+        FrameInfo {
+            len: 0,
+            is_auth: false,
+            command: command.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        }
+    }
 
     #[test]
     fn acl_last_password_wins() {
@@ -635,41 +712,21 @@ mod tests {
 
     #[test]
     fn classify_tracking_on_pins_temporarily() {
-        let frame = FrameInfo {
-            len: 0,
-            is_auth: false,
-            command: "CLIENT".to_string(),
-            args: vec!["TRACKING".to_string(), "ON".to_string()],
-        };
+        let frame = frame("CLIENT", &["TRACKING", "ON"]);
         assert_eq!(classify_command(&frame), CommandClass::PinTemporary);
     }
 
     #[test]
     fn classify_xread_block_pins_while_blocking() {
-        let frame = FrameInfo {
-            len: 0,
-            is_auth: false,
-            command: "XREAD".to_string(),
-            args: vec!["BLOCK".to_string(), "5000".to_string()],
-        };
+        let frame = frame("XREAD", &["BLOCK", "5000"]);
         assert_eq!(classify_command(&frame), CommandClass::PinWhileBlocking);
     }
 
     #[test]
     fn unpin_after_exec_clears_transaction_state() {
-        let mut state = PinnedState::default();
-        let multi = FrameInfo {
-            len: 0,
-            is_auth: false,
-            command: "MULTI".to_string(),
-            args: vec![],
-        };
-        let exec = FrameInfo {
-            len: 0,
-            is_auth: false,
-            command: "EXEC".to_string(),
-            args: vec![],
-        };
+        let mut state = SessionState::default();
+        let multi = frame("MULTI", &[]);
+        let exec = frame("EXEC", &[]);
 
         apply_command_state_before_send(&mut state, &multi, CommandClass::PinTemporary);
         apply_command_state_after_response(
@@ -688,6 +745,147 @@ mod tests {
             b"*0\r\n",
         );
         assert!(state.can_unpin());
+    }
+
+    #[test]
+    fn watch_then_unwatch_unpins() {
+        let mut state = SessionState::default();
+        let watch = frame("WATCH", &["key"]);
+        let unwatch = frame("UNWATCH", &[]);
+
+        apply_command_state_before_send(&mut state, &watch, CommandClass::PinTemporary);
+        apply_command_state_after_response(
+            &mut state,
+            &watch,
+            CommandClass::PinTemporary,
+            b"+OK\r\n",
+        );
+        assert!(!state.can_unpin());
+
+        apply_command_state_before_send(&mut state, &unwatch, CommandClass::PinTemporary);
+        apply_command_state_after_response(
+            &mut state,
+            &unwatch,
+            CommandClass::PinTemporary,
+            b"+OK\r\n",
+        );
+        assert!(state.can_unpin());
+    }
+
+    #[test]
+    fn tracking_on_error_does_not_taint_state() {
+        let mut state = SessionState::default();
+        let tracking_on = frame("CLIENT", &["TRACKING", "ON"]);
+
+        apply_command_state_before_send(&mut state, &tracking_on, CommandClass::PinTemporary);
+        apply_command_state_after_response(
+            &mut state,
+            &tracking_on,
+            CommandClass::PinTemporary,
+            b"-ERR syntax error\r\n",
+        );
+
+        assert!(state.can_unpin());
+    }
+
+    #[test]
+    fn blocking_state_clears_after_reply() {
+        let mut state = SessionState::default();
+        let blpop = frame("BLPOP", &["q", "10"]);
+
+        apply_command_state_before_send(&mut state, &blpop, CommandClass::PinWhileBlocking);
+        assert!(!state.can_unpin());
+
+        apply_command_state_after_response(
+            &mut state,
+            &blpop,
+            CommandClass::PinWhileBlocking,
+            b"-ERR timeout\r\n",
+        );
+        assert!(state.can_unpin());
+    }
+
+    #[test]
+    fn reset_clears_all_session_state() {
+        let mut state = SessionState::default();
+        let multi = frame("MULTI", &[]);
+        let watch = frame("WATCH", &["k"]);
+        let subscribe = frame("SUBSCRIBE", &["events"]);
+        let blocking = frame("BLPOP", &["q", "10"]);
+        let reset = frame("RESET", &[]);
+
+        apply_command_state_before_send(&mut state, &multi, CommandClass::PinTemporary);
+        apply_command_state_after_response(
+            &mut state,
+            &multi,
+            CommandClass::PinTemporary,
+            b"+OK\r\n",
+        );
+        apply_command_state_before_send(&mut state, &watch, CommandClass::PinTemporary);
+        apply_command_state_after_response(
+            &mut state,
+            &watch,
+            CommandClass::PinTemporary,
+            b"+OK\r\n",
+        );
+        apply_command_state_before_send(&mut state, &subscribe, CommandClass::PinForever);
+        apply_command_state_after_response(
+            &mut state,
+            &subscribe,
+            CommandClass::PinForever,
+            b"*3\r\n$9\r\nsubscribe\r\n$6\r\nevents\r\n:1\r\n",
+        );
+        apply_command_state_before_send(&mut state, &blocking, CommandClass::PinWhileBlocking);
+        apply_command_state_after_response(
+            &mut state,
+            &blocking,
+            CommandClass::PinWhileBlocking,
+            b"$-1\r\n",
+        );
+        assert!(!state.can_unpin());
+
+        apply_command_state_before_send(&mut state, &reset, CommandClass::PinTemporary);
+        apply_command_state_after_response(
+            &mut state,
+            &reset,
+            CommandClass::PinTemporary,
+            b"+RESET\r\n",
+        );
+
+        assert!(state.can_unpin());
+    }
+
+    #[test]
+    fn resp3_push_len_parses() {
+        let frame = b">3\r\n+message\r\n$7\r\nchannel\r\n$5\r\nhello\r\n";
+        let len = parse_resp_frame_len(frame)
+            .expect("parse")
+            .expect("complete frame");
+        assert_eq!(len, frame.len());
+    }
+
+    #[test]
+    fn resp3_map_len_parses() {
+        let frame = b"%2\r\n+key1\r\n:1\r\n+key2\r\n$3\r\nval\r\n";
+        let len = parse_resp_frame_len(frame)
+            .expect("parse")
+            .expect("complete frame");
+        assert_eq!(len, frame.len());
+    }
+
+    #[test]
+    fn reset_success_requires_reauth() {
+        let reset = frame("RESET", &[]);
+        assert!(should_reauth_after_reset(&reset, b"+RESET\r\n"));
+    }
+
+    #[test]
+    fn reset_error_does_not_require_reauth() {
+        let reset = frame("RESET", &[]);
+        assert!(!should_reauth_after_reset(
+            &reset,
+            b"-ERR unknown command\r\n"
+        ));
     }
 }
 
@@ -851,22 +1049,19 @@ async fn send_auth(
 }
 
 fn build_auth_command(user: &str, password: Option<&str>) -> Vec<u8> {
-    match password {
-        Some(password) => {
-            let mut out = Vec::with_capacity(64 + user.len() + password.len());
-            out.extend_from_slice(b"*3\r\n");
-            push_bulk(&mut out, b"AUTH");
-            push_bulk(&mut out, user.as_bytes());
-            push_bulk(&mut out, password.as_bytes());
-            out
-        }
-        None => {
-            let mut out = Vec::with_capacity(48 + user.len());
-            out.extend_from_slice(b"*2\r\n");
-            push_bulk(&mut out, b"AUTH");
-            push_bulk(&mut out, user.as_bytes());
-            out
-        }
+    if let Some(password) = password {
+        let mut out = Vec::with_capacity(64 + user.len() + password.len());
+        out.extend_from_slice(b"*3\r\n");
+        push_bulk(&mut out, b"AUTH");
+        push_bulk(&mut out, user.as_bytes());
+        push_bulk(&mut out, password.as_bytes());
+        out
+    } else {
+        let mut out = Vec::with_capacity(48 + user.len());
+        out.extend_from_slice(b"*2\r\n");
+        push_bulk(&mut out, b"AUTH");
+        push_bulk(&mut out, user.as_bytes());
+        out
     }
 }
 
@@ -1042,53 +1237,84 @@ fn parse_resp_frame_len_from(buf: &[u8], start: usize) -> Result<Option<usize>> 
     }
 
     match buf[start] {
-        b'+' | b'-' | b':' => {
-            let Some(line_end) = find_crlf_from(buf, start + 1) else {
+        b'+' | b'-' | b':' | b',' | b'(' | b'#' => Ok(parse_resp_line_len(buf, start)),
+        b'_' => {
+            if start + 3 > buf.len() {
                 return Ok(None);
-            };
-            Ok(Some(line_end + 2 - start))
+            }
+            if &buf[start + 1..start + 3] == b"\r\n" {
+                Ok(Some(3))
+            } else {
+                bail!("invalid RESP null frame")
+            }
         }
-        b'$' => {
-            let Some(line_end) = find_crlf_from(buf, start + 1) else {
-                return Ok(None);
-            };
-            let bulk_len = parse_number(&buf[start + 1..line_end])?;
-            if bulk_len == -1 {
-                return Ok(Some(line_end + 2 - start));
-            }
-            if bulk_len < -1 {
-                bail!("invalid bulk length");
-            }
-            let bulk_len = usize::try_from(bulk_len).context("bulk length too large")?;
-            let total = line_end + 2 + bulk_len + 2;
-            if total > buf.len() {
-                return Ok(None);
-            }
-            Ok(Some(total - start))
-        }
-        b'*' => {
-            let Some(line_end) = find_crlf_from(buf, start + 1) else {
-                return Ok(None);
-            };
-            let count = parse_number(&buf[start + 1..line_end])?;
-            if count == -1 {
-                return Ok(Some(line_end + 2 - start));
-            }
-            if count < -1 {
-                bail!("invalid array length");
-            }
-            let mut idx = line_end + 2;
-            let count = usize::try_from(count).context("array length too large")?;
-            for _ in 0..count {
-                let Some(next_len) = parse_resp_frame_len_from(buf, idx)? else {
-                    return Ok(None);
-                };
-                idx += next_len;
-            }
-            Ok(Some(idx - start))
-        }
+        b'$' => parse_resp_sized_payload_len(buf, start, -1, "invalid bulk length"),
+        b'=' | b'!' => parse_resp_sized_payload_len(buf, start, 0, "invalid payload length"),
+        b'*' | b'~' | b'>' | b'|' => parse_resp_aggregate_len(buf, start, 1),
+        b'%' => parse_resp_aggregate_len(buf, start, 2),
         _ => bail!("unsupported RESP response type"),
     }
+}
+
+fn parse_resp_line_len(buf: &[u8], start: usize) -> Option<usize> {
+    let line_end = find_crlf_from(buf, start + 1)?;
+    Some(line_end + 2 - start)
+}
+
+fn parse_resp_sized_payload_len(
+    buf: &[u8],
+    start: usize,
+    min_allowed: i64,
+    invalid_msg: &str,
+) -> Result<Option<usize>> {
+    let Some(line_end) = find_crlf_from(buf, start + 1) else {
+        return Ok(None);
+    };
+    let payload_len = parse_number(&buf[start + 1..line_end])?;
+    if min_allowed == -1 && payload_len == -1 {
+        return Ok(Some(line_end + 2 - start));
+    }
+    if payload_len < min_allowed {
+        bail!("{invalid_msg}");
+    }
+    let payload_len = usize::try_from(payload_len).context("payload length too large")?;
+    let total = line_end + 2 + payload_len + 2;
+    if total > buf.len() {
+        return Ok(None);
+    }
+    Ok(Some(total - start))
+}
+
+fn parse_resp_aggregate_len(
+    buf: &[u8],
+    start: usize,
+    child_multiplier: usize,
+) -> Result<Option<usize>> {
+    let Some(line_end) = find_crlf_from(buf, start + 1) else {
+        return Ok(None);
+    };
+
+    let count = parse_number(&buf[start + 1..line_end])?;
+    if count == -1 {
+        return Ok(Some(line_end + 2 - start));
+    }
+    if count < -1 {
+        bail!("invalid aggregate length");
+    }
+
+    let count = usize::try_from(count).context("aggregate length too large")?;
+    let children = count
+        .checked_mul(child_multiplier)
+        .ok_or_else(|| anyhow!("aggregate length too large"))?;
+
+    let mut idx = line_end + 2;
+    for _ in 0..children {
+        let Some(next_len) = parse_resp_frame_len_from(buf, idx)? else {
+            return Ok(None);
+        };
+        idx += next_len;
+    }
+    Ok(Some(idx - start))
 }
 
 fn classify_command(frame: &FrameInfo) -> CommandClass {
@@ -1112,65 +1338,69 @@ fn classify_command(frame: &FrameInfo) -> CommandClass {
 }
 
 fn apply_command_state_before_send(
-    state: &mut PinnedState,
-    frame: &FrameInfo,
+    state: &mut SessionState,
+    _frame: &FrameInfo,
     class: CommandClass,
 ) {
-    let _ = frame;
     match class {
-        CommandClass::PinWhileBlocking => state.blocking_in_flight = true,
+        CommandClass::PinWhileBlocking => state.blocking = BlockingState::Waiting,
         CommandClass::Stateless | CommandClass::PinTemporary | CommandClass::PinForever => {}
     }
 }
 
 fn apply_command_state_after_response(
-    state: &mut PinnedState,
+    state: &mut SessionState,
     frame: &FrameInfo,
     class: CommandClass,
     response: &[u8],
 ) {
     if matches!(class, CommandClass::PinWhileBlocking) && !response.is_empty() {
-        state.blocking_in_flight = false;
+        state.blocking = BlockingState::Idle;
     }
 
-    if response.first().copied() == Some(b'-') {
+    if is_error_response(response) {
         return;
     }
 
     let cmd = frame.command.as_str();
     match class {
-        CommandClass::PinForever => state.pin_forever = true,
+        CommandClass::PinForever => state.sticky = StickyState::On,
         CommandClass::PinWhileBlocking | CommandClass::PinTemporary | CommandClass::Stateless => {}
     }
 
     match cmd {
-        "MULTI" => state.in_multi = true,
-        "WATCH" => state.watch_active = true,
-        "UNWATCH" => state.watch_active = false,
+        "MULTI" => state.txn = TxnState::InMulti,
+        "WATCH" => state.watch = WatchState::On,
+        "UNWATCH" => state.watch = WatchState::Off,
         "EXEC" | "DISCARD" => {
-            state.in_multi = false;
-            state.watch_active = false;
+            state.txn = TxnState::None;
+            state.watch = WatchState::Off;
         }
         "CLIENT"
             if frame.args.first().is_some_and(|arg| arg == "TRACKING")
                 && frame.args.get(1).is_some_and(|arg| arg == "ON") =>
         {
-            state.tracking_on = true;
+            state.tracking = TrackingState::On;
         }
         "CLIENT"
             if frame.args.first().is_some_and(|arg| arg == "TRACKING")
                 && frame.args.get(1).is_some_and(|arg| arg == "OFF") =>
         {
-            state.tracking_on = false;
+            state.tracking = TrackingState::Off;
         }
         "RESET" => {
-            state.in_multi = false;
-            state.watch_active = false;
-            state.tracking_on = false;
-            state.blocking_in_flight = false;
+            *state = SessionState::default();
         }
         _ => {}
     }
+}
+
+fn is_error_response(response: &[u8]) -> bool {
+    response.first().copied() == Some(b'-') || response.first().copied() == Some(b'!')
+}
+
+fn should_reauth_after_reset(frame: &FrameInfo, response: &[u8]) -> bool {
+    frame.command == "RESET" && !is_error_response(response)
 }
 
 fn parse_number(slice: &[u8]) -> Result<i64> {

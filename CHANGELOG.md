@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.3
+
+- Added RESP3 response frame support in upstream parsing to prevent false "unsupported RESP response type" errors.
+- Refactored pinned session tracking into an explicit state-machine model for routing and unpin transitions.
+- Added upstream re-authentication after successful `RESET` to keep pooled connections authenticated.
+- Expanded tests for state transitions, RESET re-auth behavior, and RESP3 frame parsing.
+
 ## 0.2.2
 
 - Added upstream TLS connection pooling keyed by authenticated user identity.
