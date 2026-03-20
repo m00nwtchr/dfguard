@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.2
+
 - Added upstream TLS connection pooling keyed by authenticated user identity.
 - Added command-aware pinning for stateful Redis flows, including transaction/blocking/tracking detection.
 - Added automatic unpinning for temporary state after reset commands (for example, `EXEC`, `DISCARD`, `UNWATCH`, `CLIENT TRACKING OFF`).
