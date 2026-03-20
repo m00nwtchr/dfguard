@@ -47,37 +47,22 @@ spec:
             image:
               repository: ghcr.io/m00nwtchr/dfguard
               tag: rolling
-            args:
-              - --listen
-              - 0.0.0.0:6380
-              - --upstream
-              - dfguard:6379
-              - --acl
-              - /config/acl.conf
-              - --server-cert
-              - /tls/server/tls.crt
-              - --server-key
-              - /tls/server/tls.key
-              - --server-ca
-              - /tls/server/ca.crt
-              - --upstream-cert
-              - /tls/upstream/tls.crt
-              - --upstream-key
-              - /tls/upstream/tls.key
-              - --upstream-ca
-              - /tls/upstream/ca.crt
             env:
-              DFGUARD_METRICS_LISTEN: 0.0.0.0:9464
+              DFGUARD_UPSTREAM: dragonfly:6379
+              DFGUARD_METRICS_LISTEN: "[::]:9464"
               OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+              OTEL_SERVICE_NAME: dfguard
             probes:
               liveness:
                 enabled: true
-                type: TCP
-                port: 6380
+                type: HTTP
+                path: /livez
+                port: 9464
               readiness:
                 enabled: true
-                type: TCP
-                port: 6380
+                type: HTTP
+                path: /readyz
+                port: 9464
             resources:
               requests:
                 cpu: 50m
@@ -98,7 +83,7 @@ spec:
         controller: dfguard
         ports:
           redis:
-            port: 6380
+            port: 6379
           metrics:
             port: 9464
     persistence:

@@ -44,7 +44,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 #[derive(Parser, Debug, Clone)]
 #[command(name = "dfguard", version, about = "mTLS auth proxy for DragonflyDB")]
 struct Config {
-    #[arg(long, env = "DFGUARD_LISTEN")]
+    #[arg(long, env = "DFGUARD_LISTEN", default_value = "[::]:6379")]
     listen: String,
     #[arg(long, env = "DFGUARD_UPSTREAM")]
     upstream: String,

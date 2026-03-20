@@ -17,6 +17,13 @@ FROM scratch
 
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/dfguard /dfguard
 
+ENV DFGUARD_ACL="/config/acl.conf" \
+    DFGUARD_SERVER_CERT="/tls/server/tls.crt" \
+    DFGUARD_SERVER_KEY="/tls/server/tls.key" \
+    DFGUARD_SERVER_CA="/tls/server/ca.crt" \
+    DFGUARD_UPSTREAM_CERT="/tls/upstream/tls.crt" \
+    DFGUARD_UPSTREAM_KEY="/tls/upstream/tls.key" \
+    DFGUARD_UPSTREAM_CA="/tls/upstream/ca.crt"
 USER 65532:65532
 
 ENTRYPOINT ["/dfguard"]

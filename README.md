@@ -69,6 +69,7 @@ DFGUARD_UPSTREAM_CA=/path/to/upstream-ca.crt
 
 Optional env vars:
 
+- `DFGUARD_LISTEN` (default `[::]:6379`)
 - `DFGUARD_HANDSHAKE_TIMEOUT_SECS` (default `10`)
 - `DFGUARD_IDLE_TIMEOUT_SECS` (default `300`)
 - `DFGUARD_MAX_FRAME_SIZE` (default `16777216`)
