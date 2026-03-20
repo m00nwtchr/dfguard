@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.4
+
 - Added environment-variable based configuration for all runtime options (`DFGUARD_*`).
 
 ## 0.2.3
