@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Added OpenTelemetry traces, logs, and metrics export support over OTLP gRPC.
+- Added optional metrics and probe HTTP server (`DFGUARD_METRICS_LISTEN`) with `/metrics`, `/healthz`, `/readyz`, and `/livez`.
+
 ## 0.2.4
 
 - Added environment-variable based configuration for all runtime options (`DFGUARD_*`).

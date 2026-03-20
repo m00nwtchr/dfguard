@@ -74,8 +74,26 @@ Optional env vars:
 - `DFGUARD_MAX_FRAME_SIZE` (default `16777216`)
 - `DFGUARD_POOL_MAX_IDLE_PER_USER` (default `64`)
 - `DFGUARD_INSECURE_UPSTREAM` (default `false`)
+- `DFGUARD_METRICS_LISTEN` (disabled by default, for example `0.0.0.0:9464`)
 
 CLI flags override environment variables.
+
+## Observability
+
+When OTEL is configured, `dfguard` exports traces, logs, and metrics via OTLP gRPC.
+
+Common OTEL environment variables:
+
+- `OTEL_EXPORTER_OTLP_ENDPOINT` (for example `http://otel-collector:4317`)
+- `OTEL_SERVICE_NAME` (defaults to `dfguard`)
+- `OTEL_SDK_DISABLED=true` to disable OTEL initialization
+
+Metrics and probes are exposed only when `DFGUARD_METRICS_LISTEN` is set:
+
+- `/metrics` (Prometheus format)
+- `/healthz`
+- `/readyz`
+- `/livez`
 
 ## ACL format
 

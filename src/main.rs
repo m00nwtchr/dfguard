@@ -12,6 +12,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use clap::Parser;
 use notify::{RecursiveMode, Watcher};
+use opentelemetry::KeyValue;
+use opentelemetry::global;
+use opentelemetry::metrics::MeterProvider as _;
+use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
@@ -23,8 +34,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use tracing::{debug, error, info};
+use tracing::{Instrument, debug, error, info, info_span};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
@@ -64,6 +77,194 @@ struct Config {
 
     #[arg(long, env = "DFGUARD_INSECURE_UPSTREAM", default_value_t = false)]
     insecure_upstream: bool,
+
+    #[arg(long, env = "DFGUARD_METRICS_LISTEN")]
+    metrics_listen: Option<String>,
+}
+
+#[derive(Clone)]
+struct Telemetry {
+    otel_metrics: Option<Arc<OTelMetrics>>,
+    prom_metrics: Option<Arc<PromMetrics>>,
+}
+
+struct OTelRuntime {
+    _tracer: Option<SdkTracerProvider>,
+    _meter: Option<SdkMeterProvider>,
+    _logger: Option<SdkLoggerProvider>,
+}
+
+struct OTelMetrics {
+    conn_accepted: Counter<u64>,
+    conn_errors: Counter<u64>,
+    auth_blocked: Counter<u64>,
+    upstream_connect_failures: Counter<u64>,
+    upstream_reauth_failures: Counter<u64>,
+    reload_events: Counter<u64>,
+    active_connections: UpDownCounter<i64>,
+    upstream_roundtrip_ms: Histogram<f64>,
+}
+
+struct PromMetrics {
+    registry: Registry,
+    conn_accepted: IntCounter,
+    conn_errors: IntCounter,
+    auth_blocked: IntCounter,
+    upstream_connect_failures: IntCounter,
+    upstream_reauth_failures: IntCounter,
+    reload_events: IntCounter,
+    active_connections: IntGauge,
+}
+
+impl Telemetry {
+    fn noop() -> Self {
+        Self {
+            otel_metrics: None,
+            prom_metrics: None,
+        }
+    }
+
+    fn with_prometheus(prom_metrics: Arc<PromMetrics>) -> Self {
+        Self {
+            otel_metrics: None,
+            prom_metrics: Some(prom_metrics),
+        }
+    }
+
+    fn set_otel(&mut self, metrics: Arc<OTelMetrics>) {
+        self.otel_metrics = Some(metrics);
+    }
+
+    fn connection_accepted(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.conn_accepted.add(1, &[]);
+            metrics.active_connections.add(1, &[]);
+        }
+        if let Some(metrics) = &self.prom_metrics {
+            metrics.conn_accepted.inc();
+            metrics.active_connections.inc();
+        }
+    }
+
+    fn connection_closed(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.active_connections.add(-1, &[]);
+        }
+        if let Some(metrics) = &self.prom_metrics {
+            metrics.active_connections.dec();
+        }
+    }
+
+    fn connection_error(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.conn_errors.add(1, &[]);
+        }
+        if let Some(metrics) = &self.prom_metrics {
+            metrics.conn_errors.inc();
+        }
+    }
+
+    fn auth_blocked(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.auth_blocked.add(1, &[]);
+        }
+        if let Some(metrics) = &self.prom_metrics {
+            metrics.auth_blocked.inc();
+        }
+    }
+
+    fn upstream_connect_failure(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.upstream_connect_failures.add(1, &[]);
+        }
+        if let Some(metrics) = &self.prom_metrics {
+            metrics.upstream_connect_failures.inc();
+        }
+    }
+
+    fn upstream_reauth_failure(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.upstream_reauth_failures.add(1, &[]);
+        }
+        if let Some(metrics) = &self.prom_metrics {
+            metrics.upstream_reauth_failures.inc();
+        }
+    }
+
+    fn reload_event(&self, kind: &'static str, status: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.reload_events.add(
+                1,
+                &[
+                    KeyValue::new("reload.kind", kind),
+                    KeyValue::new("reload.status", status),
+                ],
+            );
+        }
+        if let Some(metrics) = &self.prom_metrics {
+            metrics.reload_events.inc();
+        }
+    }
+
+    fn observe_upstream_roundtrip_ms(&self, command: &str, elapsed: Duration) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.upstream_roundtrip_ms.record(
+                elapsed.as_secs_f64() * 1000.0,
+                &[KeyValue::new("redis.command", command.to_string())],
+            );
+        }
+    }
+}
+
+impl PromMetrics {
+    fn new() -> Result<Self> {
+        let registry = Registry::new();
+        let conn_accepted = IntCounter::new(
+            "dfguard_connections_accepted_total",
+            "Accepted downstream connections",
+        )?;
+        let conn_errors = IntCounter::new(
+            "dfguard_connection_errors_total",
+            "Downstream connection errors",
+        )?;
+        let auth_blocked = IntCounter::new(
+            "dfguard_auth_blocked_total",
+            "Blocked downstream AUTH commands",
+        )?;
+        let upstream_connect_failures = IntCounter::new(
+            "dfguard_upstream_connect_failures_total",
+            "Failed upstream connection attempts",
+        )?;
+        let upstream_reauth_failures = IntCounter::new(
+            "dfguard_upstream_reauth_failures_total",
+            "Failed upstream re-authentication attempts",
+        )?;
+        let reload_events =
+            IntCounter::new("dfguard_reload_events_total", "ACL or TLS reload events")?;
+        let active_connections = IntGauge::new(
+            "dfguard_active_connections",
+            "Active downstream connections",
+        )?;
+
+        registry.register(Box::new(conn_accepted.clone()))?;
+        registry.register(Box::new(conn_errors.clone()))?;
+        registry.register(Box::new(auth_blocked.clone()))?;
+        registry.register(Box::new(upstream_connect_failures.clone()))?;
+        registry.register(Box::new(upstream_reauth_failures.clone()))?;
+        registry.register(Box::new(reload_events.clone()))?;
+        registry.register(Box::new(active_connections.clone()))?;
+
+        Ok(Self {
+            registry,
+            conn_accepted,
+            conn_errors,
+            auth_blocked,
+            upstream_connect_failures,
+            upstream_reauth_failures,
+            reload_events,
+            active_connections,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -86,6 +287,7 @@ struct UpstreamPool {
     max_idle_per_user: usize,
     client_rx: watch::Receiver<Arc<ClientConfigs>>,
     resumption_enabled: Arc<AtomicBool>,
+    telemetry: Arc<Telemetry>,
 }
 
 #[derive(Clone, Eq, PartialEq, Hash)]
@@ -172,12 +374,22 @@ enum CommandClass {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
     let config = Config::parse();
+    let metrics_state = if config.metrics_listen.is_some() {
+        Some(Arc::new(PromMetrics::new()?))
+    } else {
+        None
+    };
+    let mut telemetry = if let Some(metrics) = metrics_state.clone() {
+        Telemetry::with_prometheus(metrics)
+    } else {
+        Telemetry::noop()
+    };
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _otel_runtime = init_telemetry(&config, filter, &mut telemetry);
+    let telemetry = Arc::new(telemetry);
+
     let acl = load_acl(&config.acl)?;
     let (acl_tx, acl_rx) = watch::channel(Arc::new(acl));
 
@@ -202,7 +414,24 @@ async fn main() -> Result<()> {
         max_idle_per_user: config.pool_max_idle_per_user,
         client_rx: client_rx.clone(),
         resumption_enabled: resumption_enabled.clone(),
+        telemetry: telemetry.clone(),
     });
+
+    if let Some(metrics_listen) = &config.metrics_listen {
+        let readiness = Arc::new(AtomicBool::new(false));
+        let readiness_for_server = readiness.clone();
+        let telemetry_for_server = telemetry.clone();
+        let metrics_listen = metrics_listen.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                start_metrics_server(&metrics_listen, telemetry_for_server, readiness_for_server)
+                    .await
+            {
+                error!("metrics server error: {err:#}");
+            }
+        });
+        readiness.store(true, Ordering::Relaxed);
+    }
 
     let listener = TcpListener::bind(&config.listen)
         .await
@@ -211,23 +440,248 @@ async fn main() -> Result<()> {
     info!("listening on {}", config.listen);
 
     let config = Arc::new(config);
-    let _acl_watcher = start_acl_watcher(config.acl.clone(), acl_tx)?;
-    let _tls_watcher = start_tls_watcher(config.clone(), server_tx, client_tx)?;
+    let _acl_watcher = start_acl_watcher(config.acl.clone(), acl_tx, telemetry.clone())?;
+    let _tls_watcher = start_tls_watcher(config.clone(), server_tx, client_tx, telemetry.clone())?;
 
     loop {
         let (socket, _) = listener.accept().await?;
+        telemetry.connection_accepted();
         let server_rx = server_rx.clone();
         let acl_rx = acl_rx.clone();
         let upstream_pool = upstream_pool.clone();
         let config = config.clone();
+        let telemetry = telemetry.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(socket, server_rx, acl_rx, config, upstream_pool).await
+            let span = info_span!("connection", peer = %socket.peer_addr().map_or_else(|_| "unknown".to_string(), |addr| addr.to_string()));
+            if let Err(err) = handle_connection(socket, server_rx, acl_rx, config, upstream_pool)
+                .instrument(span)
+                .await
             {
                 error!("connection error: {err:#}");
+                telemetry.connection_error();
+            }
+            telemetry.connection_closed();
+        });
+    }
+}
+
+fn init_telemetry(config: &Config, filter: EnvFilter, telemetry: &mut Telemetry) -> OTelRuntime {
+    let resource = Resource::builder()
+        .with_service_name(
+            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dfguard".to_string()),
+        )
+        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+        .with_attribute(KeyValue::new("dfguard.listen", config.listen.clone()))
+        .build();
+
+    let mut tracer_provider = None;
+    let mut meter_provider = None;
+    let mut logger_provider = None;
+
+    if std::env::var("OTEL_SDK_DISABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .init();
+        return OTelRuntime {
+            _tracer: None,
+            _meter: None,
+            _logger: None,
+        };
+    }
+
+    match opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
+        .map(|exporter| {
+            opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource.clone())
+                .build()
+        }) {
+        Ok(provider) => {
+            global::set_tracer_provider(provider.clone());
+            tracer_provider = Some(provider);
+        }
+        Err(err) => {
+            eprintln!("failed to initialize OTLP trace exporter: {err}");
+        }
+    }
+
+    match opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .build()
+        .map(|exporter| {
+            let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
+            opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                .with_reader(reader)
+                .with_resource(resource.clone())
+                .build()
+        }) {
+        Ok(provider) => {
+            global::set_meter_provider(provider.clone());
+            let meter = provider.meter("dfguard");
+            telemetry.set_otel(Arc::new(build_otel_metrics(&meter)));
+            meter_provider = Some(provider);
+        }
+        Err(err) => {
+            eprintln!("failed to initialize OTLP metrics exporter: {err}");
+        }
+    }
+
+    match opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .build()
+        .map(|exporter| {
+            opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource)
+                .build()
+        }) {
+        Ok(provider) => {
+            logger_provider = Some(provider);
+        }
+        Err(err) => {
+            eprintln!("failed to initialize OTLP logs exporter: {err}");
+        }
+    }
+
+    let tracer_layer = tracer_provider
+        .as_ref()
+        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("dfguard")));
+    let log_layer = logger_provider
+        .as_ref()
+        .map(OpenTelemetryTracingBridge::new);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(tracer_layer)
+        .with(log_layer)
+        .init();
+
+    OTelRuntime {
+        _tracer: tracer_provider,
+        _meter: meter_provider,
+        _logger: logger_provider,
+    }
+}
+
+fn build_otel_metrics(meter: &Meter) -> OTelMetrics {
+    OTelMetrics {
+        conn_accepted: meter.u64_counter("dfguard.connections.accepted").build(),
+        conn_errors: meter.u64_counter("dfguard.connections.errors").build(),
+        auth_blocked: meter.u64_counter("dfguard.auth.blocked").build(),
+        upstream_connect_failures: meter
+            .u64_counter("dfguard.upstream.connect.failures")
+            .build(),
+        upstream_reauth_failures: meter
+            .u64_counter("dfguard.upstream.reauth.failures")
+            .build(),
+        reload_events: meter.u64_counter("dfguard.reload.events").build(),
+        active_connections: meter
+            .i64_up_down_counter("dfguard.connections.active")
+            .build(),
+        upstream_roundtrip_ms: meter.f64_histogram("dfguard.upstream.roundtrip.ms").build(),
+    }
+}
+
+async fn start_metrics_server(
+    metrics_listen: &str,
+    telemetry: Arc<Telemetry>,
+    readiness: Arc<AtomicBool>,
+) -> Result<()> {
+    let listener = TcpListener::bind(metrics_listen)
+        .await
+        .with_context(|| format!("bind metrics listen address {metrics_listen}"))?;
+    info!("metrics endpoint listening on {metrics_listen}");
+
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+        let telemetry = telemetry.clone();
+        let readiness = readiness.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_metrics_connection(&mut socket, telemetry, readiness).await {
+                debug!("metrics connection error: {err:#}");
             }
         });
     }
+}
+
+async fn handle_metrics_connection(
+    socket: &mut TcpStream,
+    telemetry: Arc<Telemetry>,
+    readiness: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut buf = [0u8; 2048];
+    let n = socket.read(&mut buf).await?;
+    if n == 0 {
+        return Ok(());
+    }
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let path = req
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+
+    match path {
+        "/metrics" => {
+            let Some(prom) = &telemetry.prom_metrics else {
+                return write_http_response(socket, 404, "text/plain", "not found").await;
+            };
+            let metric_families = prom.registry.gather();
+            let mut body = Vec::new();
+            TextEncoder::new().encode(&metric_families, &mut body)?;
+            write_http_response_bytes(socket, 200, "text/plain; version=0.0.4", &body).await
+        }
+        "/healthz" => write_http_response(socket, 200, "text/plain", "ok").await,
+        "/livez" => write_http_response(socket, 200, "text/plain", "alive").await,
+        "/readyz" => {
+            if readiness.load(Ordering::Relaxed) {
+                write_http_response(socket, 200, "text/plain", "ready").await
+            } else {
+                write_http_response(socket, 503, "text/plain", "not ready").await
+            }
+        }
+        _ => write_http_response(socket, 404, "text/plain", "not found").await,
+    }
+}
+
+async fn write_http_response(
+    socket: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    write_http_response_bytes(socket, status, content_type, body.as_bytes()).await
+}
+
+async fn write_http_response_bytes(
+    socket: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()> {
+    let status_text = match status {
+        404 => "Not Found",
+        503 => "Service Unavailable",
+        _ => "OK",
+    };
+    let mut response = Vec::with_capacity(body.len() + 128);
+    response.extend_from_slice(
+        format!(
+            "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    response.extend_from_slice(body);
+    socket.write_all(&response).await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -293,6 +747,7 @@ async fn handle_connection(
         };
 
         if frame.is_auth {
+            upstream_pool.telemetry.auth_blocked();
             downstream
                 .write_all(b"-ERR AUTH disabled by proxy\r\n")
                 .await?;
@@ -318,8 +773,12 @@ async fn handle_connection(
         if let RouteState::Pinned(pinned_conn) = &mut route_state {
             apply_command_state_before_send(&mut pinned_conn.state, &frame, class);
             pinned_conn.conn.tls.write_all(&data).await?;
+            let started = tokio::time::Instant::now();
             let response =
                 read_upstream_response(&mut pinned_conn.conn, idle_timeout, max_frame_size).await?;
+            upstream_pool
+                .telemetry
+                .observe_upstream_roundtrip_ms(&frame.command, started.elapsed());
             downstream.write_all(&response).await?;
             apply_command_state_after_response(&mut pinned_conn.state, &frame, class, &response);
 
@@ -332,6 +791,7 @@ async fn handle_connection(
                 else {
                     unreachable!("state just matched pinned");
                 };
+                upstream_pool.telemetry.upstream_reauth_failure();
                 error!("upstream re-authentication after RESET failed: {err:#}");
                 downstream
                     .write_all(b"-ERR proxy failed to reauthenticate upstream after RESET\r\n")
@@ -352,7 +812,11 @@ async fn handle_connection(
 
         let mut conn = upstream_pool.checkout(&key, password.as_deref()).await?;
         conn.tls.write_all(&data).await?;
+        let started = tokio::time::Instant::now();
         let response = read_upstream_response(&mut conn, idle_timeout, max_frame_size).await?;
+        upstream_pool
+            .telemetry
+            .observe_upstream_roundtrip_ms(&frame.command, started.elapsed());
         downstream.write_all(&response).await?;
         upstream_pool.release(&key, conn).await;
     }
@@ -405,11 +869,13 @@ impl UpstreamPool {
                             self.server_name.clone(),
                             self.handshake_timeout,
                         )
-                        .await?;
+                        .await
+                        .inspect_err(|_| self.telemetry.upstream_connect_failure())?;
                         self.resumption_enabled.store(false, Ordering::Relaxed);
                         info!("upstream TLS resumption disabled for future connections");
                         stream
                     } else {
+                        self.telemetry.upstream_connect_failure();
                         return Err(err);
                     }
                 }
@@ -421,10 +887,13 @@ impl UpstreamPool {
                 self.server_name.clone(),
                 self.handshake_timeout,
             )
-            .await?
+            .await
+            .inspect_err(|_| self.telemetry.upstream_connect_failure())?
         };
 
-        send_auth(&mut upstream_tls, &key.user, password).await?;
+        send_auth(&mut upstream_tls, &key.user, password)
+            .await
+            .inspect_err(|_| self.telemetry.upstream_connect_failure())?;
 
         Ok(UpstreamConn {
             tls: upstream_tls,
@@ -502,6 +971,7 @@ fn load_acl(path: &Path) -> Result<HashMap<String, AclEntry>> {
 fn start_acl_watcher(
     path: PathBuf,
     acl_tx: watch::Sender<Arc<HashMap<String, AclEntry>>>,
+    telemetry: Arc<Telemetry>,
 ) -> Result<notify::RecommendedWatcher> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -522,9 +992,11 @@ fn start_acl_watcher(
             match load_acl(&path) {
                 Ok(map) => {
                     let _ = acl_tx.send(Arc::new(map));
+                    telemetry.reload_event("acl", "success");
                     info!("ACL reloaded");
                 }
                 Err(err) => {
+                    telemetry.reload_event("acl", "error");
                     error!("ACL reload failed: {err:#}");
                 }
             }
@@ -538,6 +1010,7 @@ fn start_tls_watcher(
     config: Arc<Config>,
     server_tx: watch::Sender<Arc<ServerConfig>>,
     client_tx: watch::Sender<Arc<ClientConfigs>>,
+    telemetry: Arc<Telemetry>,
 ) -> Result<notify::RecommendedWatcher> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -568,9 +1041,13 @@ fn start_tls_watcher(
             match build_server_config(config.as_ref()) {
                 Ok(server_config) => {
                     let _ = server_tx.send(Arc::new(server_config));
+                    telemetry.reload_event("tls_server", "success");
                     info!("server TLS config reloaded");
                 }
-                Err(err) => error!("server TLS reload failed: {err:#}"),
+                Err(err) => {
+                    telemetry.reload_event("tls_server", "error");
+                    error!("server TLS reload failed: {err:#}");
+                }
             }
 
             match (
@@ -583,9 +1060,11 @@ fn start_tls_watcher(
                         no_resumption: Arc::new(no_resumption),
                     };
                     let _ = client_tx.send(Arc::new(configs));
+                    telemetry.reload_event("tls_upstream", "success");
                     info!("upstream TLS config reloaded");
                 }
                 (Err(err), _) | (_, Err(err)) => {
+                    telemetry.reload_event("tls_upstream", "error");
                     error!("upstream TLS reload failed: {err:#}");
                 }
             }

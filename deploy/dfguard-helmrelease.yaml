@@ -66,6 +66,9 @@ spec:
               - /tls/upstream/tls.key
               - --upstream-ca
               - /tls/upstream/ca.crt
+            env:
+              DFGUARD_METRICS_LISTEN: 0.0.0.0:9464
+              OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
             probes:
               liveness:
                 enabled: true
@@ -96,6 +99,8 @@ spec:
         ports:
           redis:
             port: 6380
+          metrics:
+            port: 9464
     persistence:
       acl:
         type: configMap
