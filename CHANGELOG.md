@@ -4,8 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.5
+
 - Added OpenTelemetry traces, logs, and metrics export support over OTLP gRPC.
 - Added optional metrics and probe HTTP server (`DFGUARD_METRICS_LISTEN`) with `/metrics`, `/healthz`, `/readyz`, and `/livez`.
+- Updated deployment example to use environment-based configuration and HTTP probe endpoints.
+- Added Docker image defaults for ACL and TLS path environment variables.
+- Defaulted `DFGUARD_LISTEN` to `[::]:6379` when unspecified.
 
 ## 0.2.4
 
