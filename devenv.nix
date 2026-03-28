@@ -20,12 +20,13 @@ in
       git
       cargo-nextest
       cargo-audit
+      cargo-flamegraph
     ]);
 
   # https://devenv.sh/languages/
   languages.rust = {
     enable = true;
-    mold.enable = true;
+    # mold.enable = true;
   };
 
   # https://devenv.sh/services/
