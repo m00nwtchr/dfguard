@@ -1,4 +1,4 @@
-#![warn(clippy::pedantic)]
+#![warn(clippy::pedantic, clippy::disallowed_types)]
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -22,6 +22,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use parking_lot::Mutex;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
@@ -30,7 +31,7 @@ use rustls::pki_types::{
 use rustls::{AlertDescription, ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{Instrument, debug, error, info, info_span};
@@ -39,6 +40,9 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "dfguard", version, about = "mTLS auth proxy for DragonflyDB")]
@@ -577,6 +581,9 @@ async fn main() -> Result<()> {
 
     loop {
         let (socket, _) = listener.accept().await?;
+        if let Err(err) = socket.set_nodelay(true) {
+            debug!("failed to enable downstream TCP_NODELAY: {err}");
+        }
         telemetry.connection_accepted();
         let server_rx = server_rx.clone();
         let acl_rx = acl_rx.clone();
@@ -960,7 +967,7 @@ async fn handle_connection(
                 upstream_pool
                     .telemetry
                     .pin_transition("pinned", "stateless", "client_eof");
-                upstream_pool.release(&key, pinned_conn.conn).await;
+                upstream_pool.release(&key, pinned_conn.conn);
             }
             upstream_pool
                 .telemetry
@@ -1086,7 +1093,7 @@ async fn handle_connection(
                 upstream_pool
                     .telemetry
                     .pin_transition("pinned", "stateless", "state_cleared");
-                upstream_pool.release(&key, pinned_conn.conn).await;
+                upstream_pool.release(&key, pinned_conn.conn);
             }
             continue;
         }
@@ -1109,14 +1116,14 @@ async fn handle_connection(
             .telemetry
             .observe_response_size(response.len(), class);
         downstream.write_all(&response).await?;
-        upstream_pool.release(&key, conn).await;
+        upstream_pool.release(&key, conn);
     }
 }
 
 impl UpstreamPool {
     async fn checkout(&self, key: &PoolKey, password: Option<&str>) -> Result<UpstreamConn> {
         if let Some(conn) = {
-            let mut idle = self.idle.lock().await;
+            let mut idle = self.idle.lock();
             idle.get_mut(key).and_then(Vec::pop)
         } {
             self.telemetry.pool_checkout_hit();
@@ -1127,14 +1134,14 @@ impl UpstreamPool {
         self.connect_new(key, password).await
     }
 
-    async fn release(&self, key: &PoolKey, conn: UpstreamConn) {
+    fn release(&self, key: &PoolKey, conn: UpstreamConn) {
         if !conn.read_buf.is_empty() {
             self.telemetry
                 .pool_release_dropped(PoolDropReason::ReadBufNotEmpty.as_str());
             return;
         }
 
-        let mut idle = self.idle.lock().await;
+        let mut idle = self.idle.lock();
         let entry = idle.entry(key.clone()).or_default();
         if entry.len() < self.max_idle_per_user {
             entry.push(conn);
@@ -1984,14 +1991,14 @@ async fn read_next_command_frame(
     buffer: &mut BytesMut,
     idle_timeout: Option<Duration>,
     max_frame_size: usize,
-) -> Result<Option<(FrameInfo, Vec<u8>)>> {
+) -> Result<Option<(FrameInfo, BytesMut)>> {
     let mut read_buf = [0u8; 8192];
     loop {
         if let Some(frame) = parse_command_frame(buffer)? {
             if frame.len > max_frame_size {
                 bail!("frame exceeds max size");
             }
-            let data = buffer.split_to(frame.len).to_vec();
+            let data = buffer.split_to(frame.len);
             return Ok(Some((frame, data)));
         }
 
@@ -2026,14 +2033,14 @@ async fn read_upstream_response(
     upstream: &mut UpstreamConn,
     idle_timeout: Option<Duration>,
     max_frame_size: usize,
-) -> Result<Vec<u8>> {
+) -> Result<BytesMut> {
     let mut read_buf = [0u8; 8192];
     loop {
         if let Some(len) = parse_resp_frame_len(&upstream.read_buf)? {
             if len > max_frame_size {
                 bail!("response frame exceeds max size");
             }
-            return Ok(upstream.read_buf.split_to(len).to_vec());
+            return Ok(upstream.read_buf.split_to(len));
         }
 
         let n = match idle_timeout {
@@ -2299,6 +2306,9 @@ async fn connect_upstream(
             telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "error");
             telemetry.connection_error("tcp_connect", "upstream");
         })?;
+    if let Err(err) = upstream_socket.set_nodelay(true) {
+        debug!("failed to enable upstream TCP_NODELAY: {err}");
+    }
     telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "success");
 
     let tls_started = tokio::time::Instant::now();

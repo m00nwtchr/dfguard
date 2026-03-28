@@ -23,6 +23,17 @@ Minimal mTLS-authenticating proxy for DragonflyDB/Redis.
 cargo build --release
 ```
 
+## Performance Profiling
+
+- Run the repeatable campaign workflow in `PERF_PLAN.md`.
+- Generate long-run load flamegraphs with:
+
+```bash
+./scripts/perf_campaign.sh
+```
+
+The script runs warmup + profiling for stateless and mixed routing integration tests and writes outputs to `perf-results/<timestamp>`.
+
 ## Run
 
 ```bash
