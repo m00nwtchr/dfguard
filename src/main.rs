@@ -67,7 +67,7 @@ struct Config {
 
     #[arg(long, env = "DFGUARD_HANDSHAKE_TIMEOUT_SECS", default_value = "10")]
     handshake_timeout_secs: u64,
-    #[arg(long, env = "DFGUARD_IDLE_TIMEOUT_SECS", default_value = "300")]
+    #[arg(long, env = "DFGUARD_IDLE_TIMEOUT_SECS", default_value = "0")]
     idle_timeout_secs: u64,
     #[arg(long, env = "DFGUARD_MAX_FRAME_SIZE", default_value = "16777216")]
     max_frame_size: usize,
@@ -712,7 +712,7 @@ async fn handle_connection(
     let server_config = server_rx.borrow().clone();
     let acceptor = TlsAcceptor::from(server_config);
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
-    let idle_timeout = Duration::from_secs(config.idle_timeout_secs);
+    let idle_timeout = idle_timeout_from_secs(config.idle_timeout_secs);
     let tls_stream = match timeout(handshake_timeout, acceptor.accept(socket)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => {
@@ -1151,8 +1151,8 @@ where
 mod tests {
     use super::{
         CommandClass, FrameInfo, SessionState, apply_command_state_after_response,
-        apply_command_state_before_send, classify_command, parse_acl_lines, parse_resp_frame_len,
-        should_reauth_after_reset,
+        apply_command_state_before_send, classify_command, idle_timeout_from_secs, parse_acl_lines,
+        parse_resp_frame_len, should_reauth_after_reset,
     };
 
     fn frame(command: &str, args: &[&str]) -> FrameInfo {
@@ -1382,6 +1382,19 @@ mod tests {
             &reset,
             b"-ERR unknown command\r\n"
         ));
+    }
+
+    #[test]
+    fn idle_timeout_zero_disables_timeout() {
+        assert_eq!(idle_timeout_from_secs(0), None);
+    }
+
+    #[test]
+    fn idle_timeout_positive_enables_timeout() {
+        assert_eq!(
+            idle_timeout_from_secs(300),
+            Some(std::time::Duration::from_secs(300))
+        );
     }
 }
 
@@ -1659,7 +1672,7 @@ fn to_upper_ascii_string(bytes: &[u8]) -> String {
 async fn read_next_command_frame(
     downstream: &mut tokio_rustls::server::TlsStream<TcpStream>,
     buffer: &mut BytesMut,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
     max_frame_size: usize,
 ) -> Result<Option<(FrameInfo, Vec<u8>)>> {
     let mut read_buf = [0u8; 8192];
@@ -1672,10 +1685,17 @@ async fn read_next_command_frame(
             return Ok(Some((frame, data)));
         }
 
-        let n = match timeout(idle_timeout, downstream.read(&mut read_buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(anyhow!(err)),
-            Err(_) => return Err(anyhow!("downstream idle timeout")),
+        let n = match idle_timeout {
+            Some(idle_timeout) => match timeout(idle_timeout, downstream.read(&mut read_buf)).await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(err)) => return Err(anyhow!(err)),
+                Err(_) => return Err(anyhow!("downstream idle timeout")),
+            },
+            None => downstream
+                .read(&mut read_buf)
+                .await
+                .map_err(anyhow::Error::from)?,
         };
 
         if n == 0 {
@@ -1694,7 +1714,7 @@ async fn read_next_command_frame(
 
 async fn read_upstream_response(
     upstream: &mut UpstreamConn,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
     max_frame_size: usize,
 ) -> Result<Vec<u8>> {
     let mut read_buf = [0u8; 8192];
@@ -1706,10 +1726,19 @@ async fn read_upstream_response(
             return Ok(upstream.read_buf.split_to(len).to_vec());
         }
 
-        let n = match timeout(idle_timeout, upstream.tls.read(&mut read_buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(err)) => return Err(anyhow!(err)),
-            Err(_) => return Err(anyhow!("upstream idle timeout")),
+        let n = match idle_timeout {
+            Some(idle_timeout) => {
+                match timeout(idle_timeout, upstream.tls.read(&mut read_buf)).await {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(err)) => return Err(anyhow!(err)),
+                    Err(_) => return Err(anyhow!("upstream idle timeout")),
+                }
+            }
+            None => upstream
+                .tls
+                .read(&mut read_buf)
+                .await
+                .map_err(anyhow::Error::from)?,
         };
 
         if n == 0 {
@@ -1963,6 +1992,14 @@ fn should_retry_without_resumption(err: &anyhow::Error) -> bool {
         }
     }
     err.to_string().contains("InternalError")
+}
+
+fn idle_timeout_from_secs(secs: u64) -> Option<Duration> {
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
 }
 
 fn is_tls_handshake_eof(err: &dyn std::error::Error) -> bool {

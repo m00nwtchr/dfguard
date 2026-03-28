@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Changed `DFGUARD_IDLE_TIMEOUT_SECS` default to `0` (disabled) to align with Redis server idle-timeout behavior while keeping handshake/connect timeouts configurable and bounded.
+
 ## 0.2.6
 
 - Avoid initializing OTEL exporters when no OTLP endpoint is configured.
