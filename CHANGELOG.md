@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.7
+
 - Changed `DFGUARD_IDLE_TIMEOUT_SECS` default to `0` (disabled) to align with Redis server idle-timeout behavior while keeping handshake/connect timeouts configurable and bounded.
 - Switched runtime metrics to OTEL-only and removed the Prometheus `/metrics` endpoint while keeping `/healthz`, `/readyz`, and `/livez` on `DFGUARD_METRICS_LISTEN`.
 - Expanded telemetry with pool/routing/state/size metrics and added additional spans around handshake, checkout/connect/auth stages, and reload flows.
