@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.8
+
+- Switched synchronization on pooled upstream idle connections to `parking_lot::Mutex` and enforced disallowed `std::sync` lock types through clippy configuration.
+- Enabled `TCP_NODELAY` on downstream accepted sockets and upstream TCP connections, and removed hot-path frame copies by returning `BytesMut` from frame readers.
+- Added load-focused integration tests, a profiling campaign script, and performance documentation for repeatable benchmarking and flamegraph capture.
+
 ## 0.2.7
 
 - Changed `DFGUARD_IDLE_TIMEOUT_SECS` default to `0` (disabled) to align with Redis server idle-timeout behavior while keeping handshake/connect timeouts configurable and bounded.
