@@ -22,7 +22,6 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
@@ -85,7 +84,8 @@ struct Config {
 #[derive(Clone)]
 struct Telemetry {
     otel_metrics: Option<Arc<OTelMetrics>>,
-    prom_metrics: Option<Arc<PromMetrics>>,
+    tls_resumption_enabled: Arc<std::sync::atomic::AtomicI64>,
+    acl_entries: Arc<std::sync::atomic::AtomicI64>,
 }
 
 struct OTelRuntime {
@@ -96,43 +96,72 @@ struct OTelRuntime {
 
 struct OTelMetrics {
     conn_accepted: Counter<u64>,
-    conn_errors: Counter<u64>,
+    errors: Counter<u64>,
+    conn_closed: Counter<u64>,
     auth_blocked: Counter<u64>,
-    upstream_connect_failures: Counter<u64>,
-    upstream_reauth_failures: Counter<u64>,
+    commands_total: Counter<u64>,
+    commands_rejected: Counter<u64>,
+    pin_transitions: Counter<u64>,
+    session_unpin: Counter<u64>,
+    session_reauth_after_reset: Counter<u64>,
+    session_reauth_after_reset_failures: Counter<u64>,
+    upstream_auth_failures: Counter<u64>,
+    pool_checkout_hit: Counter<u64>,
+    pool_checkout_miss: Counter<u64>,
+    pool_connect_new: Counter<u64>,
+    pool_release_dropped: Counter<u64>,
     reload_events: Counter<u64>,
     active_connections: UpDownCounter<i64>,
+    pool_idle_connections: UpDownCounter<i64>,
+    acl_entries: UpDownCounter<i64>,
+    tls_resumption_enabled: UpDownCounter<i64>,
+    downstream_tls_handshake_ms: Histogram<f64>,
+    upstream_tcp_connect_ms: Histogram<f64>,
+    upstream_tls_handshake_ms: Histogram<f64>,
+    upstream_auth_ms: Histogram<f64>,
     upstream_roundtrip_ms: Histogram<f64>,
-}
-
-struct PromMetrics {
-    registry: Registry,
-    conn_accepted: IntCounter,
-    conn_errors: IntCounter,
-    auth_blocked: IntCounter,
-    upstream_connect_failures: IntCounter,
-    upstream_reauth_failures: IntCounter,
-    reload_events: IntCounter,
-    active_connections: IntGauge,
+    session_pinned_ms: Histogram<f64>,
+    downstream_command_size_bytes: Histogram<u64>,
+    upstream_response_size_bytes: Histogram<u64>,
 }
 
 impl Telemetry {
-    fn noop() -> Self {
+    fn new() -> Self {
         Self {
             otel_metrics: None,
-            prom_metrics: None,
-        }
-    }
-
-    fn with_prometheus(prom_metrics: Arc<PromMetrics>) -> Self {
-        Self {
-            otel_metrics: None,
-            prom_metrics: Some(prom_metrics),
+            tls_resumption_enabled: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            acl_entries: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
     fn set_otel(&mut self, metrics: Arc<OTelMetrics>) {
+        let acl_entries = self.acl_entries.load(Ordering::Relaxed);
+        let tls_resumption_enabled = self.tls_resumption_enabled.load(Ordering::Relaxed);
+        if acl_entries != 0 {
+            metrics.acl_entries.add(acl_entries, &[]);
+        }
+        metrics
+            .tls_resumption_enabled
+            .add(tls_resumption_enabled, &[]);
         self.otel_metrics = Some(metrics);
+    }
+
+    fn set_acl_entries(&self, size: usize) {
+        let Ok(size) = i64::try_from(size) else {
+            return;
+        };
+        let prev = self.acl_entries.swap(size, Ordering::Relaxed);
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.acl_entries.add(size - prev, &[]);
+        }
+    }
+
+    fn set_tls_resumption_enabled(&self, enabled: bool) {
+        let value = i64::from(enabled);
+        let prev = self.tls_resumption_enabled.swap(value, Ordering::Relaxed);
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.tls_resumption_enabled.add(value - prev, &[]);
+        }
     }
 
     fn connection_accepted(&self) {
@@ -140,54 +169,73 @@ impl Telemetry {
             metrics.conn_accepted.add(1, &[]);
             metrics.active_connections.add(1, &[]);
         }
-        if let Some(metrics) = &self.prom_metrics {
-            metrics.conn_accepted.inc();
-            metrics.active_connections.inc();
-        }
     }
 
     fn connection_closed(&self) {
         if let Some(metrics) = &self.otel_metrics {
             metrics.active_connections.add(-1, &[]);
         }
-        if let Some(metrics) = &self.prom_metrics {
-            metrics.active_connections.dec();
+    }
+
+    fn connection_error(&self, stage: &'static str, direction: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.errors.add(
+                1,
+                &[
+                    KeyValue::new("error.stage", stage),
+                    KeyValue::new("error.direction", direction),
+                ],
+            );
         }
     }
 
-    fn connection_error(&self) {
+    fn connection_closed_reason(&self, reason: &'static str) {
         if let Some(metrics) = &self.otel_metrics {
-            metrics.conn_errors.add(1, &[]);
-        }
-        if let Some(metrics) = &self.prom_metrics {
-            metrics.conn_errors.inc();
+            metrics
+                .conn_closed
+                .add(1, &[KeyValue::new("close.reason", reason)]);
         }
     }
 
     fn auth_blocked(&self) {
         if let Some(metrics) = &self.otel_metrics {
             metrics.auth_blocked.add(1, &[]);
-        }
-        if let Some(metrics) = &self.prom_metrics {
-            metrics.auth_blocked.inc();
-        }
-    }
-
-    fn upstream_connect_failure(&self) {
-        if let Some(metrics) = &self.otel_metrics {
-            metrics.upstream_connect_failures.add(1, &[]);
-        }
-        if let Some(metrics) = &self.prom_metrics {
-            metrics.upstream_connect_failures.inc();
+            metrics
+                .commands_rejected
+                .add(1, &[KeyValue::new("reason", "auth_disabled")]);
         }
     }
 
-    fn upstream_reauth_failure(&self) {
+    fn command_classified(&self, command: &str, class: CommandClass) {
         if let Some(metrics) = &self.otel_metrics {
-            metrics.upstream_reauth_failures.add(1, &[]);
+            metrics.commands_total.add(
+                1,
+                &[
+                    KeyValue::new("redis.command", command.to_string()),
+                    KeyValue::new("route.class", class.as_str()),
+                ],
+            );
         }
-        if let Some(metrics) = &self.prom_metrics {
-            metrics.upstream_reauth_failures.inc();
+    }
+
+    fn pin_transition(&self, from: &'static str, to: &'static str, reason: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.pin_transitions.add(
+                1,
+                &[
+                    KeyValue::new("pin.from", from),
+                    KeyValue::new("pin.to", to),
+                    KeyValue::new("pin.reason", reason),
+                ],
+            );
+        }
+    }
+
+    fn session_unpin(&self, reason: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics
+                .session_unpin
+                .add(1, &[KeyValue::new("reason", reason)]);
         }
     }
 
@@ -201,9 +249,6 @@ impl Telemetry {
                 ],
             );
         }
-        if let Some(metrics) = &self.prom_metrics {
-            metrics.reload_events.inc();
-        }
     }
 
     fn observe_upstream_roundtrip_ms(&self, command: &str, elapsed: Duration) {
@@ -214,56 +259,123 @@ impl Telemetry {
             );
         }
     }
-}
 
-impl PromMetrics {
-    fn new() -> Result<Self> {
-        let registry = Registry::new();
-        let conn_accepted = IntCounter::new(
-            "dfguard_connections_accepted_total",
-            "Accepted downstream connections",
-        )?;
-        let conn_errors = IntCounter::new(
-            "dfguard_connection_errors_total",
-            "Downstream connection errors",
-        )?;
-        let auth_blocked = IntCounter::new(
-            "dfguard_auth_blocked_total",
-            "Blocked downstream AUTH commands",
-        )?;
-        let upstream_connect_failures = IntCounter::new(
-            "dfguard_upstream_connect_failures_total",
-            "Failed upstream connection attempts",
-        )?;
-        let upstream_reauth_failures = IntCounter::new(
-            "dfguard_upstream_reauth_failures_total",
-            "Failed upstream re-authentication attempts",
-        )?;
-        let reload_events =
-            IntCounter::new("dfguard_reload_events_total", "ACL or TLS reload events")?;
-        let active_connections = IntGauge::new(
-            "dfguard_active_connections",
-            "Active downstream connections",
-        )?;
+    fn observe_downstream_handshake_ms(&self, elapsed: Duration, status: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.downstream_tls_handshake_ms.record(
+                elapsed.as_secs_f64() * 1000.0,
+                &[KeyValue::new("status", status)],
+            );
+        }
+    }
 
-        registry.register(Box::new(conn_accepted.clone()))?;
-        registry.register(Box::new(conn_errors.clone()))?;
-        registry.register(Box::new(auth_blocked.clone()))?;
-        registry.register(Box::new(upstream_connect_failures.clone()))?;
-        registry.register(Box::new(upstream_reauth_failures.clone()))?;
-        registry.register(Box::new(reload_events.clone()))?;
-        registry.register(Box::new(active_connections.clone()))?;
+    fn observe_upstream_tcp_connect_ms(&self, elapsed: Duration, status: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.upstream_tcp_connect_ms.record(
+                elapsed.as_secs_f64() * 1000.0,
+                &[KeyValue::new("status", status)],
+            );
+        }
+    }
 
-        Ok(Self {
-            registry,
-            conn_accepted,
-            conn_errors,
-            auth_blocked,
-            upstream_connect_failures,
-            upstream_reauth_failures,
-            reload_events,
-            active_connections,
-        })
+    fn observe_upstream_tls_handshake_ms(&self, elapsed: Duration, status: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.upstream_tls_handshake_ms.record(
+                elapsed.as_secs_f64() * 1000.0,
+                &[KeyValue::new("status", status)],
+            );
+        }
+    }
+
+    fn observe_upstream_auth_ms(&self, elapsed: Duration, status: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.upstream_auth_ms.record(
+                elapsed.as_secs_f64() * 1000.0,
+                &[KeyValue::new("status", status)],
+            );
+        }
+    }
+
+    fn upstream_auth_failure(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.upstream_auth_failures.add(1, &[]);
+        }
+    }
+
+    fn observe_pinned_duration_ms(&self, elapsed: Duration, reason: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.session_pinned_ms.record(
+                elapsed.as_secs_f64() * 1000.0,
+                &[KeyValue::new("reason", reason)],
+            );
+        }
+    }
+
+    fn observe_command_size(&self, size: usize, class: CommandClass) {
+        if let Some(metrics) = &self.otel_metrics
+            && let Ok(size) = u64::try_from(size)
+        {
+            metrics
+                .downstream_command_size_bytes
+                .record(size, &[KeyValue::new("route.class", class.as_str())]);
+        }
+    }
+
+    fn observe_response_size(&self, size: usize, class: CommandClass) {
+        if let Some(metrics) = &self.otel_metrics
+            && let Ok(size) = u64::try_from(size)
+        {
+            metrics
+                .upstream_response_size_bytes
+                .record(size, &[KeyValue::new("route.class", class.as_str())]);
+        }
+    }
+
+    fn pool_checkout_hit(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.pool_checkout_hit.add(1, &[]);
+        }
+    }
+
+    fn pool_checkout_miss(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.pool_checkout_miss.add(1, &[]);
+        }
+    }
+
+    fn pool_connect_new(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.pool_connect_new.add(1, &[]);
+        }
+    }
+
+    fn pool_idle_delta(&self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.pool_idle_connections.add(delta, &[]);
+        }
+    }
+
+    fn pool_release_dropped(&self, reason: &'static str) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics
+                .pool_release_dropped
+                .add(1, &[KeyValue::new("reason", reason)]);
+        }
+    }
+
+    fn reauth_after_reset_attempt(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.session_reauth_after_reset.add(1, &[]);
+        }
+    }
+
+    fn reauth_after_reset_failure(&self) {
+        if let Some(metrics) = &self.otel_metrics {
+            metrics.session_reauth_after_reset_failures.add(1, &[]);
+        }
     }
 }
 
@@ -357,6 +469,7 @@ impl SessionState {
 struct PinnedConn {
     conn: UpstreamConn,
     state: SessionState,
+    pinned_at: PinnedAt,
 }
 
 enum RouteState {
@@ -372,25 +485,47 @@ enum CommandClass {
     PinWhileBlocking,
 }
 
+impl CommandClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stateless => "stateless",
+            Self::PinTemporary => "pin_temporary",
+            Self::PinForever => "pin_forever",
+            Self::PinWhileBlocking => "pin_while_blocking",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PoolDropReason {
+    ReadBufNotEmpty,
+    PoolFull,
+}
+
+impl PoolDropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadBufNotEmpty => "read_buf_not_empty",
+            Self::PoolFull => "pool_full",
+        }
+    }
+}
+
+struct PinnedAt {
+    started: tokio::time::Instant,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
-    let metrics_state = if config.metrics_listen.is_some() {
-        Some(Arc::new(PromMetrics::new()?))
-    } else {
-        None
-    };
-    let mut telemetry = if let Some(metrics) = metrics_state.clone() {
-        Telemetry::with_prometheus(metrics)
-    } else {
-        Telemetry::noop()
-    };
+    let mut telemetry = Telemetry::new();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _otel_runtime = init_telemetry(&config, filter, &mut telemetry);
     let telemetry = Arc::new(telemetry);
 
     let acl = load_acl(&config.acl)?;
+    telemetry.set_acl_entries(acl.len());
     let (acl_tx, acl_rx) = watch::channel(Arc::new(acl));
 
     let server_config = Arc::new(build_server_config(&config)?);
@@ -401,6 +536,7 @@ async fn main() -> Result<()> {
     let (server_tx, server_rx) = watch::channel(server_config);
     let (client_tx, client_rx) = watch::channel(client_configs);
     let resumption_enabled = Arc::new(AtomicBool::new(true));
+    telemetry.set_tls_resumption_enabled(true);
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 
     let (upstream_host, _upstream_port) = parse_host_port(&config.upstream)?;
@@ -420,13 +556,9 @@ async fn main() -> Result<()> {
     if let Some(metrics_listen) = &config.metrics_listen {
         let readiness = Arc::new(AtomicBool::new(false));
         let readiness_for_server = readiness.clone();
-        let telemetry_for_server = telemetry.clone();
         let metrics_listen = metrics_listen.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                start_metrics_server(&metrics_listen, telemetry_for_server, readiness_for_server)
-                    .await
-            {
+            if let Err(err) = start_metrics_server(&metrics_listen, readiness_for_server).await {
                 error!("metrics server error: {err:#}");
             }
         });
@@ -458,7 +590,8 @@ async fn main() -> Result<()> {
                 .await
             {
                 error!("connection error: {err:#}");
-                telemetry.connection_error();
+                telemetry.connection_error("connection_task", "downstream");
+                telemetry.connection_closed_reason("error");
             }
             telemetry.connection_closed();
         });
@@ -590,38 +723,67 @@ fn has_otel_otlp_endpoint_env() -> bool {
 fn build_otel_metrics(meter: &Meter) -> OTelMetrics {
     OTelMetrics {
         conn_accepted: meter.u64_counter("dfguard.connections.accepted").build(),
-        conn_errors: meter.u64_counter("dfguard.connections.errors").build(),
+        errors: meter.u64_counter("dfguard.errors.total").build(),
+        conn_closed: meter.u64_counter("dfguard.connections.closed").build(),
         auth_blocked: meter.u64_counter("dfguard.auth.blocked").build(),
-        upstream_connect_failures: meter
-            .u64_counter("dfguard.upstream.connect.failures")
+        commands_total: meter.u64_counter("dfguard.commands.total").build(),
+        commands_rejected: meter.u64_counter("dfguard.commands.rejected").build(),
+        pin_transitions: meter.u64_counter("dfguard.pin.transitions").build(),
+        session_unpin: meter.u64_counter("dfguard.session.unpin").build(),
+        session_reauth_after_reset: meter
+            .u64_counter("dfguard.session.reauth_after_reset")
             .build(),
-        upstream_reauth_failures: meter
-            .u64_counter("dfguard.upstream.reauth.failures")
+        session_reauth_after_reset_failures: meter
+            .u64_counter("dfguard.session.reauth_after_reset.failures")
             .build(),
+        upstream_auth_failures: meter.u64_counter("dfguard.upstream.auth.failures").build(),
+        pool_checkout_hit: meter.u64_counter("dfguard.pool.checkout.hit").build(),
+        pool_checkout_miss: meter.u64_counter("dfguard.pool.checkout.miss").build(),
+        pool_connect_new: meter.u64_counter("dfguard.pool.connect_new").build(),
+        pool_release_dropped: meter.u64_counter("dfguard.pool.release.dropped").build(),
         reload_events: meter.u64_counter("dfguard.reload.events").build(),
         active_connections: meter
             .i64_up_down_counter("dfguard.connections.active")
             .build(),
+        pool_idle_connections: meter
+            .i64_up_down_counter("dfguard.pool.idle.connections")
+            .build(),
+        acl_entries: meter.i64_up_down_counter("dfguard.acl.entries").build(),
+        tls_resumption_enabled: meter
+            .i64_up_down_counter("dfguard.tls.resumption.enabled")
+            .build(),
+        downstream_tls_handshake_ms: meter
+            .f64_histogram("dfguard.downstream.tls.handshake.ms")
+            .build(),
+        upstream_tcp_connect_ms: meter
+            .f64_histogram("dfguard.upstream.tcp.connect.ms")
+            .build(),
+        upstream_tls_handshake_ms: meter
+            .f64_histogram("dfguard.upstream.tls.handshake.ms")
+            .build(),
+        upstream_auth_ms: meter.f64_histogram("dfguard.upstream.auth.ms").build(),
         upstream_roundtrip_ms: meter.f64_histogram("dfguard.upstream.roundtrip.ms").build(),
+        session_pinned_ms: meter.f64_histogram("dfguard.session.pinned.ms").build(),
+        downstream_command_size_bytes: meter
+            .u64_histogram("dfguard.downstream.command.size_bytes")
+            .build(),
+        upstream_response_size_bytes: meter
+            .u64_histogram("dfguard.upstream.response.size_bytes")
+            .build(),
     }
 }
 
-async fn start_metrics_server(
-    metrics_listen: &str,
-    telemetry: Arc<Telemetry>,
-    readiness: Arc<AtomicBool>,
-) -> Result<()> {
+async fn start_metrics_server(metrics_listen: &str, readiness: Arc<AtomicBool>) -> Result<()> {
     let listener = TcpListener::bind(metrics_listen)
         .await
         .with_context(|| format!("bind metrics listen address {metrics_listen}"))?;
-    info!("metrics endpoint listening on {metrics_listen}");
+    info!("probe endpoint listening on {metrics_listen}");
 
     loop {
         let (mut socket, _) = listener.accept().await?;
-        let telemetry = telemetry.clone();
         let readiness = readiness.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_metrics_connection(&mut socket, telemetry, readiness).await {
+            if let Err(err) = handle_metrics_connection(&mut socket, readiness).await {
                 debug!("metrics connection error: {err:#}");
             }
         });
@@ -630,7 +792,6 @@ async fn start_metrics_server(
 
 async fn handle_metrics_connection(
     socket: &mut TcpStream,
-    telemetry: Arc<Telemetry>,
     readiness: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut buf = [0u8; 2048];
@@ -646,15 +807,6 @@ async fn handle_metrics_connection(
         .unwrap_or("/");
 
     match path {
-        "/metrics" => {
-            let Some(prom) = &telemetry.prom_metrics else {
-                return write_http_response(socket, 404, "text/plain", "not found").await;
-            };
-            let metric_families = prom.registry.gather();
-            let mut body = Vec::new();
-            TextEncoder::new().encode(&metric_families, &mut body)?;
-            write_http_response_bytes(socket, 200, "text/plain; version=0.0.4", &body).await
-        }
         "/healthz" => write_http_response(socket, 200, "text/plain", "ok").await,
         "/livez" => write_http_response(socket, 200, "text/plain", "alive").await,
         "/readyz" => {
@@ -713,17 +865,44 @@ async fn handle_connection(
     let acceptor = TlsAcceptor::from(server_config);
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
     let idle_timeout = idle_timeout_from_secs(config.idle_timeout_secs);
-    let tls_stream = match timeout(handshake_timeout, acceptor.accept(socket)).await {
+    let handshake_started = tokio::time::Instant::now();
+    let tls_stream = match timeout(handshake_timeout, acceptor.accept(socket))
+        .instrument(info_span!("downstream_tls_handshake"))
+        .await
+    {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => {
+            upstream_pool
+                .telemetry
+                .observe_downstream_handshake_ms(handshake_started.elapsed(), "error");
             if is_tls_handshake_eof(&err) {
+                upstream_pool
+                    .telemetry
+                    .connection_closed_reason("downstream_tls_eof");
                 debug!("downstream TLS handshake eof");
                 return Ok(());
             }
+            upstream_pool
+                .telemetry
+                .connection_error("tls_handshake", "downstream");
             return Err(anyhow!(err)).context("downstream TLS handshake failed");
         }
-        Err(_) => return Err(anyhow!("downstream TLS handshake timeout")),
+        Err(_) => {
+            upstream_pool
+                .telemetry
+                .observe_downstream_handshake_ms(handshake_started.elapsed(), "timeout");
+            upstream_pool
+                .telemetry
+                .connection_error("tls_handshake", "downstream");
+            upstream_pool
+                .telemetry
+                .connection_closed_reason("handshake_timeout");
+            return Err(anyhow!("downstream TLS handshake timeout"));
+        }
     };
+    upstream_pool
+        .telemetry
+        .observe_downstream_handshake_ms(handshake_started.elapsed(), "success");
 
     let user = extract_dns_user(&tls_stream)?;
     let acl = acl_rx.borrow().clone();
@@ -740,14 +919,29 @@ async fn handle_connection(
     let max_frame_size = config.max_frame_size;
 
     loop {
-        let Some((frame, data)) = read_next_command_frame(
+        let frame_result = read_next_command_frame(
             &mut downstream,
             &mut downstream_buf,
             idle_timeout,
             max_frame_size,
         )
-        .await?
-        else {
+        .await;
+
+        let frame = match frame_result {
+            Ok(frame) => frame,
+            Err(err) => {
+                let close_reason = close_reason_from_io_error(&err);
+                upstream_pool
+                    .telemetry
+                    .connection_closed_reason(close_reason);
+                upstream_pool
+                    .telemetry
+                    .connection_error("read", "downstream");
+                return Err(err);
+            }
+        };
+
+        let Some((frame, data)) = frame else {
             let should_release = match &route_state {
                 RouteState::Pinned(pinned_conn) => pinned_conn.state.can_unpin(),
                 RouteState::Stateless => false,
@@ -758,8 +952,19 @@ async fn handle_connection(
                 else {
                     unreachable!("release checked pinned state");
                 };
+                upstream_pool.telemetry.observe_pinned_duration_ms(
+                    pinned_conn.pinned_at.started.elapsed(),
+                    "client_eof",
+                );
+                upstream_pool.telemetry.session_unpin("client_eof");
+                upstream_pool
+                    .telemetry
+                    .pin_transition("pinned", "stateless", "client_eof");
                 upstream_pool.release(&key, pinned_conn.conn).await;
             }
+            upstream_pool
+                .telemetry
+                .connection_closed_reason("client_eof");
             return Ok(());
         };
 
@@ -772,6 +977,12 @@ async fn handle_connection(
         }
 
         let class = classify_command(&frame);
+        upstream_pool
+            .telemetry
+            .command_classified(&frame.command, class);
+        upstream_pool
+            .telemetry
+            .observe_command_size(data.len(), class);
         if matches!(route_state, RouteState::Stateless)
             && matches!(
                 class,
@@ -780,11 +991,25 @@ async fn handle_connection(
                     | CommandClass::PinWhileBlocking
             )
         {
-            let conn = upstream_pool.checkout(&key, password.as_deref()).await?;
+            let conn = upstream_pool
+                .checkout(&key, password.as_deref())
+                .instrument(info_span!(
+                    "upstream_checkout",
+                    route_class = class.as_str(),
+                    mode = "pin"
+                ))
+                .await?;
             route_state = RouteState::Pinned(Box::new(PinnedConn {
                 conn,
                 state: SessionState::default(),
+                pinned_at: PinnedAt {
+                    started: tokio::time::Instant::now(),
+                },
             }));
+            upstream_pool
+                .telemetry
+                .pin_transition("stateless", "pinned", "stateful_command");
+            debug!(route_class = class.as_str(), "route transitioned to pinned");
         }
 
         if let RouteState::Pinned(pinned_conn) = &mut route_state {
@@ -792,28 +1017,59 @@ async fn handle_connection(
             pinned_conn.conn.tls.write_all(&data).await?;
             let started = tokio::time::Instant::now();
             let response =
-                read_upstream_response(&mut pinned_conn.conn, idle_timeout, max_frame_size).await?;
+                read_upstream_response(&mut pinned_conn.conn, idle_timeout, max_frame_size)
+                    .instrument(info_span!("upstream_response", route_mode = "pinned"))
+                    .await?;
             upstream_pool
                 .telemetry
                 .observe_upstream_roundtrip_ms(&frame.command, started.elapsed());
+            upstream_pool
+                .telemetry
+                .observe_response_size(response.len(), class);
             downstream.write_all(&response).await?;
             apply_command_state_after_response(&mut pinned_conn.state, &frame, class, &response);
 
-            if should_reauth_after_reset(&frame, &response)
-                && let Err(err) =
-                    send_auth(&mut pinned_conn.conn.tls, &key.user, password.as_deref()).await
-            {
-                let RouteState::Pinned(_dropped_conn) =
-                    std::mem::replace(&mut route_state, RouteState::Stateless)
-                else {
-                    unreachable!("state just matched pinned");
-                };
-                upstream_pool.telemetry.upstream_reauth_failure();
-                error!("upstream re-authentication after RESET failed: {err:#}");
-                downstream
-                    .write_all(b"-ERR proxy failed to reauthenticate upstream after RESET\r\n")
-                    .await?;
-                continue;
+            if should_reauth_after_reset(&frame, &response) {
+                upstream_pool.telemetry.reauth_after_reset_attempt();
+                let reauth_started = tokio::time::Instant::now();
+                match send_auth(&mut pinned_conn.conn.tls, &key.user, password.as_deref())
+                    .instrument(info_span!("upstream_auth", trigger = "reset"))
+                    .await
+                {
+                    Ok(()) => upstream_pool
+                        .telemetry
+                        .observe_upstream_auth_ms(reauth_started.elapsed(), "success"),
+                    Err(err) => {
+                        let RouteState::Pinned(dropped_conn) =
+                            std::mem::replace(&mut route_state, RouteState::Stateless)
+                        else {
+                            unreachable!("state just matched pinned");
+                        };
+                        upstream_pool.telemetry.observe_pinned_duration_ms(
+                            dropped_conn.pinned_at.started.elapsed(),
+                            "reauth_failed",
+                        );
+                        upstream_pool.telemetry.session_unpin("reauth_failed");
+                        upstream_pool.telemetry.pin_transition(
+                            "pinned",
+                            "stateless",
+                            "reauth_failed",
+                        );
+                        upstream_pool.telemetry.reauth_after_reset_failure();
+                        upstream_pool.telemetry.upstream_auth_failure();
+                        upstream_pool
+                            .telemetry
+                            .observe_upstream_auth_ms(reauth_started.elapsed(), "error");
+                        upstream_pool.telemetry.connection_error("auth", "upstream");
+                        error!("upstream re-authentication after RESET failed: {err:#}");
+                        downstream
+                            .write_all(
+                                b"-ERR proxy failed to reauthenticate upstream after RESET\r\n",
+                            )
+                            .await?;
+                        continue;
+                    }
+                }
             }
 
             if pinned_conn.state.can_unpin() {
@@ -822,18 +1078,36 @@ async fn handle_connection(
                 else {
                     unreachable!("state just matched pinned");
                 };
+                upstream_pool.telemetry.observe_pinned_duration_ms(
+                    pinned_conn.pinned_at.started.elapsed(),
+                    "state_cleared",
+                );
+                upstream_pool.telemetry.session_unpin("state_cleared");
+                upstream_pool
+                    .telemetry
+                    .pin_transition("pinned", "stateless", "state_cleared");
                 upstream_pool.release(&key, pinned_conn.conn).await;
             }
             continue;
         }
 
-        let mut conn = upstream_pool.checkout(&key, password.as_deref()).await?;
+        let mut conn = upstream_pool
+            .checkout(&key, password.as_deref())
+            .instrument(info_span!(
+                "upstream_checkout",
+                route_class = class.as_str(),
+                mode = "stateless"
+            ))
+            .await?;
         conn.tls.write_all(&data).await?;
         let started = tokio::time::Instant::now();
         let response = read_upstream_response(&mut conn, idle_timeout, max_frame_size).await?;
         upstream_pool
             .telemetry
             .observe_upstream_roundtrip_ms(&frame.command, started.elapsed());
+        upstream_pool
+            .telemetry
+            .observe_response_size(response.len(), class);
         downstream.write_all(&response).await?;
         upstream_pool.release(&key, conn).await;
     }
@@ -845,13 +1119,18 @@ impl UpstreamPool {
             let mut idle = self.idle.lock().await;
             idle.get_mut(key).and_then(Vec::pop)
         } {
+            self.telemetry.pool_checkout_hit();
+            self.telemetry.pool_idle_delta(-1);
             return Ok(conn);
         }
+        self.telemetry.pool_checkout_miss();
         self.connect_new(key, password).await
     }
 
     async fn release(&self, key: &PoolKey, conn: UpstreamConn) {
         if !conn.read_buf.is_empty() {
+            self.telemetry
+                .pool_release_dropped(PoolDropReason::ReadBufNotEmpty.as_str());
             return;
         }
 
@@ -859,10 +1138,15 @@ impl UpstreamPool {
         let entry = idle.entry(key.clone()).or_default();
         if entry.len() < self.max_idle_per_user {
             entry.push(conn);
+            self.telemetry.pool_idle_delta(1);
+        } else {
+            self.telemetry
+                .pool_release_dropped(PoolDropReason::PoolFull.as_str());
         }
     }
 
     async fn connect_new(&self, key: &PoolKey, password: Option<&str>) -> Result<UpstreamConn> {
+        self.telemetry.pool_connect_new();
         let client_configs = self.client_rx.borrow().clone();
         let connector = TlsConnector::from(client_configs.with_resumption.clone());
         let connector_no_resumption = TlsConnector::from(client_configs.no_resumption.clone());
@@ -873,6 +1157,7 @@ impl UpstreamPool {
                 self.upstream_addr,
                 self.server_name.clone(),
                 self.handshake_timeout,
+                self.telemetry.as_ref(),
             )
             .await
             {
@@ -885,14 +1170,14 @@ impl UpstreamPool {
                             self.upstream_addr,
                             self.server_name.clone(),
                             self.handshake_timeout,
+                            self.telemetry.as_ref(),
                         )
-                        .await
-                        .inspect_err(|_| self.telemetry.upstream_connect_failure())?;
+                        .await?;
                         self.resumption_enabled.store(false, Ordering::Relaxed);
+                        self.telemetry.set_tls_resumption_enabled(false);
                         info!("upstream TLS resumption disabled for future connections");
                         stream
                     } else {
-                        self.telemetry.upstream_connect_failure();
                         return Err(err);
                     }
                 }
@@ -903,14 +1188,23 @@ impl UpstreamPool {
                 self.upstream_addr,
                 self.server_name.clone(),
                 self.handshake_timeout,
+                self.telemetry.as_ref(),
             )
-            .await
-            .inspect_err(|_| self.telemetry.upstream_connect_failure())?
+            .await?
         };
 
+        let auth_started = tokio::time::Instant::now();
         send_auth(&mut upstream_tls, &key.user, password)
+            .instrument(info_span!("upstream_auth", trigger = "connect_new"))
             .await
-            .inspect_err(|_| self.telemetry.upstream_connect_failure())?;
+            .inspect_err(|_| {
+                self.telemetry.upstream_auth_failure();
+                self.telemetry.connection_error("auth", "upstream");
+                self.telemetry
+                    .observe_upstream_auth_ms(auth_started.elapsed(), "error");
+            })?;
+        self.telemetry
+            .observe_upstream_auth_ms(auth_started.elapsed(), "success");
 
         Ok(UpstreamConn {
             tls: upstream_tls,
@@ -1006,13 +1300,18 @@ fn start_acl_watcher(
         while event_rx.recv().await.is_some() {
             debug!("ACL change detected, reloading");
             tokio::time::sleep(Duration::from_millis(200)).await;
-            match load_acl(&path) {
+            match async { load_acl(&path) }
+                .instrument(info_span!("acl_reload", path = %path.display()))
+                .await
+            {
                 Ok(map) => {
+                    telemetry.set_acl_entries(map.len());
                     let _ = acl_tx.send(Arc::new(map));
                     telemetry.reload_event("acl", "success");
                     info!("ACL reloaded");
                 }
                 Err(err) => {
+                    telemetry.connection_error("reload", "downstream");
                     telemetry.reload_event("acl", "error");
                     error!("ACL reload failed: {err:#}");
                 }
@@ -1055,32 +1354,43 @@ fn start_tls_watcher(
         while event_rx.recv().await.is_some() {
             debug!("TLS change detected, reloading");
             tokio::time::sleep(Duration::from_millis(200)).await;
-            match build_server_config(config.as_ref()) {
+            match async { build_server_config(config.as_ref()) }
+                .instrument(info_span!("tls_reload_server"))
+                .await
+            {
                 Ok(server_config) => {
                     let _ = server_tx.send(Arc::new(server_config));
                     telemetry.reload_event("tls_server", "success");
                     info!("server TLS config reloaded");
                 }
                 Err(err) => {
+                    telemetry.connection_error("reload", "downstream");
                     telemetry.reload_event("tls_server", "error");
                     error!("server TLS reload failed: {err:#}");
                 }
             }
 
-            match (
-                build_client_config(config.as_ref(), false),
-                build_client_config(config.as_ref(), true),
-            ) {
+            match async {
+                (
+                    build_client_config(config.as_ref(), false),
+                    build_client_config(config.as_ref(), true),
+                )
+            }
+            .instrument(info_span!("tls_reload_upstream"))
+            .await
+            {
                 (Ok(with_resumption), Ok(no_resumption)) => {
                     let configs = ClientConfigs {
                         with_resumption: Arc::new(with_resumption),
                         no_resumption: Arc::new(no_resumption),
                     };
                     let _ = client_tx.send(Arc::new(configs));
+                    telemetry.set_tls_resumption_enabled(true);
                     telemetry.reload_event("tls_upstream", "success");
                     info!("upstream TLS config reloaded");
                 }
                 (Err(err), _) | (_, Err(err)) => {
+                    telemetry.connection_error("reload", "upstream");
                     telemetry.reload_event("tls_upstream", "error");
                     error!("upstream TLS reload failed: {err:#}");
                 }
@@ -1928,6 +2238,19 @@ fn should_reauth_after_reset(frame: &FrameInfo, response: &[u8]) -> bool {
     frame.command == "RESET" && !is_error_response(response)
 }
 
+fn close_reason_from_io_error(err: &anyhow::Error) -> &'static str {
+    let msg = err.to_string();
+    if msg.contains("idle timeout") {
+        "idle_timeout"
+    } else if msg.contains("partial frame") {
+        "partial_frame"
+    } else if msg.contains("upstream closed") {
+        "upstream_closed"
+    } else {
+        "error"
+    }
+}
+
 fn parse_number(slice: &[u8]) -> Result<i64> {
     let s = std::str::from_utf8(slice).context("invalid number")?;
     let n = s.parse::<i64>().context("invalid number")?;
@@ -1961,16 +2284,41 @@ async fn connect_upstream(
     addr: SocketAddr,
     server_name: ServerName<'static>,
     timeout_duration: Duration,
+    telemetry: &Telemetry,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let tcp_started = tokio::time::Instant::now();
     let upstream_socket = timeout(timeout_duration, TcpStream::connect(addr))
+        .instrument(info_span!("upstream_tcp_connect"))
         .await
-        .context("upstream TCP connect timeout")??;
+        .inspect_err(|_| {
+            telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "timeout");
+            telemetry.connection_error("tcp_connect", "upstream");
+        })
+        .context("upstream TCP connect timeout")?
+        .inspect_err(|_| {
+            telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "error");
+            telemetry.connection_error("tcp_connect", "upstream");
+        })?;
+    telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "success");
+
+    let tls_started = tokio::time::Instant::now();
     let upstream_tls = timeout(
         timeout_duration,
         connector.connect(server_name, upstream_socket),
     )
+    .instrument(info_span!("upstream_tls_handshake"))
     .await
-    .context("upstream TLS handshake timeout")??;
+    .inspect_err(|_| {
+        telemetry.observe_upstream_tls_handshake_ms(tls_started.elapsed(), "timeout");
+        telemetry.connection_error("tls_handshake", "upstream");
+    })
+    .context("upstream TLS handshake timeout")?
+    .inspect_err(|_| {
+        telemetry.observe_upstream_tls_handshake_ms(tls_started.elapsed(), "error");
+        telemetry.connection_error("tls_handshake", "upstream");
+    })?;
+    telemetry.observe_upstream_tls_handshake_ms(tls_started.elapsed(), "success");
+
     Ok(upstream_tls)
 }
 
