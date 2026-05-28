@@ -111,8 +111,6 @@ struct TunnelConfig {
     key: PathBuf,
     #[arg(long, value_name = "FILE", env = "DFGUARD_TUNNEL_CA")]
     ca: PathBuf,
-    #[arg(long, env = "DFGUARD_TUNNEL_VERIFY_HOST")]
-    verify_host: String,
     #[arg(long, env = "DFGUARD_TUNNEL_TCP_NODELAY", default_value_t = false)]
     tcp_nodelay: bool,
     #[arg(
@@ -677,7 +675,7 @@ async fn run_tunnel(config: TunnelConfig) -> Result<()> {
 
     let (upstream_host, upstream_port) = parse_host_port(&config.upstream)?;
     let upstream_addr = resolve_addr(&config.upstream)?;
-    let server_name = parse_server_name(&config.verify_host)?;
+    let server_name = parse_server_name(&upstream_host)?;
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_clone = shutdown_flag.clone();

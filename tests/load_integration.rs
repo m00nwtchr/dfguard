@@ -695,14 +695,7 @@ async fn tunnel_proxy_upstream_full_flow() {
 
     let tunnel_port = free_port();
     let tunnel_addr = format!("127.0.0.1:{tunnel_port}");
-    let mut tunnel_child = spawn_tunnel_for_chain(
-        &pki,
-        &tunnel_addr,
-        "127.0.0.1",
-        proxy_port,
-        proxy_port,
-        "localhost",
-    );
+    let mut tunnel_child = spawn_tunnel_for_chain(&pki, &tunnel_addr, "127.0.0.1", proxy_port);
     let _tunnel_guard = ChildGuard::new(&mut tunnel_child);
 
     let tunnel_ready = async {
@@ -766,9 +759,7 @@ fn spawn_tunnel_for_chain(
     pki: &TestPki,
     listen_addr: &str,
     upstream_host: &str,
-    _upstream_port: u16,
     proxy_port: u16,
-    verify_host: &str,
 ) -> Child {
     Command::new(env!("CARGO_BIN_EXE_dfguard"))
         .arg("tunnel")
@@ -782,8 +773,6 @@ fn spawn_tunnel_for_chain(
         .arg(&pki.downstream_client_key_path)
         .arg("--ca")
         .arg(&pki.ca_cert_path)
-        .arg("--verify-host")
-        .arg(verify_host)
         .env("RUST_LOG", "debug")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

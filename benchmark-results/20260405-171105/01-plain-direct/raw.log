@@ -1,0 +1,157 @@
+memtier_benchmark: unrecognized option '--json-out-json=/out/results.json'
+Usage: memtier_benchmark [options]
+A memcache/redis NoSQL traffic generator and performance benchmarking tool.
+
+Connection and General Options:
+  -h, --host=ADDR                Server address (default: localhost)
+  -s, --server=ADDR              Same as --host
+  -p, --port=PORT                Server port (default: 6379)
+  -S, --unix-socket=SOCKET       UNIX Domain socket name (default: none)
+  -4, --ipv4                     Force IPv4 address resolution.
+  -6  --ipv6                     Force IPv6 address resolution.
+  -P, --protocol=PROTOCOL        Protocol to use (default: redis).
+                                 other supported protocols are resp2, resp3, memcache_text and memcache_binary.
+                                 when using one of resp2 or resp3 the redis protocol version will be set via HELLO command.
+  -a, --authenticate=CREDENTIALS Authenticate using specified credentials.
+                                 A simple password is used for memcache_text
+                                 and Redis <= 5.x. <USER>:<PASSWORD> can be
+                                 specified for memcache_binary or Redis 6.x
+                                 or newer with ACL user support.
+  -u, --uri=URI                  Server URI on format redis://user:password@host:port/dbnum
+                                 User, password and dbnum are optional. For authentication
+                                 without a username, use username 'default'. For TLS, use
+                                 the scheme 'rediss'.
+      --tls                      Enable SSL/TLS transport security
+      --cert=FILE                Use specified client certificate for TLS
+      --key=FILE                 Use specified private key for TLS
+      --cacert=FILE              Use specified CA certs bundle for TLS
+      --tls-skip-verify          Skip verification of server certificate
+      --tls-protocols            Specify the tls protocol version to use, comma delemited. Use a combination of 'TLSv1', 'TLSv1.1', 'TLSv1.2' and 'TLSv1.3'.
+      --sni=STRING               Add an SNI header
+  -x, --run-count=NUMBER         Number of full-test iterations to perform
+  -D, --debug                    Print debug output
+      --cluster-mode             Run client in cluster mode
+  -h, --help                     Display this help
+  -v, --version                  Display version information
+
+Results Output Options:
+  -o, --out-file=FILE            Name of output file (default: stdout)
+      --json-out-file=FILE       Name of JSON output file, if not set, will not print to json
+      --client-stats=FILE        Produce per-client stats file
+      --hdr-file-prefix=FILE     Prefix of HDR Latency Histogram output files, if not set, will not save latency histogram files
+      --show-config              Print detailed configuration before running
+      --hide-histogram           Don't print detailed latency histogram
+      --print-percentiles        Specify which percentiles info to print on the results table (by default prints percentiles: 50,99,99.9)
+      --print-all-runs           When performing multiple test iterations, print and save results for all iterations
+      --command-stats-breakdown=command|line
+                                 How to group command statistics in the output (default: command)
+                                 command: aggregate by command name (first word, e.g., SET, GET)
+                                 line: show each command line separately
+      --statsd-host=HOST         StatsD server hostname to send real-time metrics (default: none, disabled)
+      --statsd-port=PORT         StatsD server UDP port (default: 8125)
+      --statsd-prefix=PREFIX     Prefix for StatsD metric names (default: memtier)
+      --statsd-run-label=LABEL   Label for this benchmark run, used to distinguish runs in dashboards (default: default)
+      --graphite-port=PORT       Graphite HTTP port for event annotations (default: 8080 for host access; use 80 when running inside the Docker network)
+
+Test Options:
+  -n, --requests=NUMBER          Number of total requests per client (default: 10000)
+                                 use 'allkeys' to run on the entire key-range
+      --rate-limiting=NUMBER     The max number of requests to make per second from an individual connection (default is unlimited rate).
+                                 If you use --rate-limiting and a very large rate is entered which cannot be met, memtier will do as many requests as possible per second.
+  -c, --clients=NUMBER           Number of clients per thread (default: 50)
+  -t, --threads=NUMBER           Number of threads (default: 4)
+      --test-time=SECS           Number of seconds to run the test
+      --clients-start=NUMBER     Starting number of clients per thread for staircase ramp-up.
+                                 Must be less than --clients. Requires --clients-step and --step-duration.
+      --clients-step=NUMBER      Number of clients to add per step in staircase ramp-up.
+      --step-duration=SECS       Duration in seconds of each step before adding more clients.
+      --ratio=RATIO              Set:Get ratio (default: 1:10)
+      --pipeline=NUMBER          Number of concurrent pipelined requests (default: 1)
+      --reconnect-interval=NUM   Number of requests after which re-connection is performed
+      --reconnect-on-error       Enable automatic reconnection on connection errors (default: disabled)
+      --max-reconnect-attempts=NUM Maximum number of reconnection attempts (default: 0, unlimited)
+      --reconnect-backoff-factor=NUM Backoff factor for reconnection delays (default: 0, no backoff)
+      --connection-timeout=SECS  Connection timeout in seconds, 0 to disable (default: 0)
+      --thread-conn-start-min-jitter-micros=NUM Minimum jitter in microseconds between connection creation (default: 0)
+      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation (default: 0)
+      --multi-key-get=NUM        Enable multi-key get commands, up to NUM keys (default: 0)
+      --select-db=DB             DB number to select, when testing a redis server
+      --distinct-client-seed     Use a different random seed for each client
+      --randomize                random seed based on timestamp (default is constant value)
+
+Arbitrary command:
+      --command=COMMAND          Specify a command to send in quotes.
+                                 Each command that you specify is run with its ratio and key-pattern options.
+                                 For example: --command="set __key__ 5" --command-ratio=2 --command-key-pattern=G
+                                 To use a generated key or object, enter:
+                                   __key__: Use key generated from Key Options.
+                                   __data__: Use data generated from Object Options.
+      --command-ratio            The number of times the command is sent in sequence.(default: 1)
+      --command-key-pattern      Key pattern for the command (default: R):
+                                 G for Gaussian distribution.
+                                 R for uniform Random.
+                                 Z for zipf distribution (will limit keys to positive).
+                                 S for Sequential.
+                                 P for Parallel (Sequential were each client has a subset of the key-range).
+      --monitor-input=FILE       Read commands from Redis MONITOR output file.
+                                 Commands can be referenced as __monitor_line1__, __monitor_line2__, etc.
+                                 Use __monitor_line@__ to select commands from the file.
+                                 By default, selection is sequential; use --monitor-pattern=R for random.
+                                 For example: --monitor-input=monitor.txt --command="__monitor_line1__"
+      --monitor-pattern=S|R      Pattern for selecting monitor commands (default: S for Sequential)
+                                 S for Sequential selection.
+                                 R for Random selection.
+      --scan-incremental-iteration
+                                 Enable SCAN cursor iteration mode. When used with
+                                 --command="SCAN 0 [MATCH pattern] [COUNT count] [TYPE type]",
+                                 automatically follows the cursor returned by each SCAN response.
+                                 Sends "SCAN 0 ..." initially, then "SCAN <cursor> ..." until
+                                 the cursor returns 0, then restarts. Requires --pipeline 1.
+                                 Stats are reported separately for "SCAN 0" and "SCAN <cursor>".
+      --scan-incremental-max-iterations=NUMBER
+                                 Maximum number of continuation SCANs per iteration cycle
+                                 (default: 0, follow cursor until it returns 0).
+
+Object Options:
+  -d  --data-size=SIZE           Object data size in bytes (default: 32)
+      --data-offset=OFFSET       Actual size of value will be data-size + data-offset
+                                 Will use SETRANGE / GETRANGE (default: 0)
+  -R  --random-data              Indicate that data should be randomized
+      --data-size-range=RANGE    Use random-sized items in the specified range (min-max)
+      --data-size-list=LIST      Use sizes from weight list (size1:weight1,..sizeN:weightN)
+      --data-size-pattern=R|S    Use together with data-size-range
+                                 when set to R, a random size from the defined data sizes will be used,
+                                 when set to S, the defined data sizes will be evenly distributed across
+                                 the key range, see --key-maximum (default R)
+      --expiry-range=RANGE       Use random expiry values from the specified range
+
+Imported Data Options:
+      --data-import=FILE         Read object data from file
+      --data-verify              Enable data verification when test is complete
+      --verify-only              Only perform --data-verify, without any other test
+      --generate-keys            Generate keys for imported objects
+      --no-expiry                Ignore expiry information in imported data
+
+Key Options:
+      --key-prefix=PREFIX        Prefix for keys (default: "memtier-")
+      --key-minimum=NUMBER       Key ID minimum value (default: 0)
+      --key-maximum=NUMBER       Key ID maximum value (default: 10000000)
+      --key-pattern=PATTERN      Set:Get pattern (default: R:R)
+                                 G for Gaussian distribution.
+                                 R for uniform Random.
+                                 Z for zipf distribution (will limit keys to positive).
+                                 S for Sequential.
+                                 P for Parallel (Sequential were each client has a subset of the key-range).
+      --key-stddev               The standard deviation used in the Gaussian distribution
+                                 (default is key range / 6)
+      --key-median               The median point used in the Gaussian distribution
+                                 (default is the center of the key range)
+      --key-zipf-exp             The exponent used in the zipf distribution, limit to (0, 5)
+                                 Higher exponents result in higher concentration in top keys
+                                 (default is 1, though any number >2 seems insane)
+
+WAIT Options:
+      --wait-ratio=RATIO         Set:Wait ratio (default is no WAIT commands - 1:0)
+      --num-slaves=RANGE         WAIT for a random number of slaves in the specified range
+      --wait-timeout=RANGE       WAIT for a random number of milliseconds in the specified range (normal 
+                                 distribution with the center in the middle of the range)
