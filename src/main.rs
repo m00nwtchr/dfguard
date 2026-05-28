@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use notify::{RecursiveMode, Watcher};
 use opentelemetry::KeyValue;
 use opentelemetry::global;
@@ -44,44 +44,90 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[derive(Subcommand, Debug, Clone)]
+enum Commands {
+    Proxy(ProxyConfig),
+    Tunnel(TunnelConfig),
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "dfguard", version, about = "mTLS auth proxy for DragonflyDB")]
-struct Config {
-    #[arg(long, env = "DFGUARD_LISTEN", default_value = "[::]:6379")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Parser, Debug, Clone)]
+struct ProxyConfig {
+    #[arg(long, env = "DFGUARD_PROXY_LISTEN", default_value = "[::]:6379")]
     listen: String,
-    #[arg(long, env = "DFGUARD_UPSTREAM")]
+    #[arg(long, env = "DFGUARD_PROXY_UPSTREAM")]
     upstream: String,
-    #[arg(long, value_name = "FILE", env = "DFGUARD_ACL")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_PROXY_ACL")]
     acl: PathBuf,
-
-    #[arg(long, value_name = "FILE", env = "DFGUARD_SERVER_CERT")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_PROXY_SERVER_CERT")]
     server_cert: PathBuf,
-    #[arg(long, value_name = "FILE", env = "DFGUARD_SERVER_KEY")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_PROXY_SERVER_KEY")]
     server_key: PathBuf,
-    #[arg(long, value_name = "FILE", env = "DFGUARD_SERVER_CA")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_PROXY_SERVER_CA")]
     server_ca: PathBuf,
-
-    #[arg(long, value_name = "FILE", env = "DFGUARD_UPSTREAM_CERT")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_PROXY_UPSTREAM_CERT")]
     upstream_cert: PathBuf,
-    #[arg(long, value_name = "FILE", env = "DFGUARD_UPSTREAM_KEY")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_PROXY_UPSTREAM_KEY")]
     upstream_key: PathBuf,
-    #[arg(long, value_name = "FILE", env = "DFGUARD_UPSTREAM_CA")]
+    #[arg(long, value_name = "FILE", env = "DFGUARD_PROXY_UPSTREAM_CA")]
     upstream_ca: PathBuf,
-
-    #[arg(long, env = "DFGUARD_HANDSHAKE_TIMEOUT_SECS", default_value = "10")]
+    #[arg(
+        long,
+        env = "DFGUARD_PROXY_HANDSHAKE_TIMEOUT_SECS",
+        default_value = "10"
+    )]
     handshake_timeout_secs: u64,
-    #[arg(long, env = "DFGUARD_IDLE_TIMEOUT_SECS", default_value = "0")]
+    #[arg(long, env = "DFGUARD_PROXY_IDLE_TIMEOUT_SECS", default_value = "0")]
     idle_timeout_secs: u64,
-    #[arg(long, env = "DFGUARD_MAX_FRAME_SIZE", default_value = "16777216")]
+    #[arg(long, env = "DFGUARD_PROXY_MAX_FRAME_SIZE", default_value = "16777216")]
     max_frame_size: usize,
-
-    #[arg(long, env = "DFGUARD_POOL_MAX_IDLE_PER_USER", default_value = "64")]
+    #[arg(
+        long,
+        env = "DFGUARD_PROXY_POOL_MAX_IDLE_PER_USER",
+        default_value = "64"
+    )]
     pool_max_idle_per_user: usize,
-
-    #[arg(long, env = "DFGUARD_INSECURE_UPSTREAM", default_value_t = false)]
+    #[arg(long, env = "DFGUARD_PROXY_INSECURE_UPSTREAM", default_value_t = false)]
     insecure_upstream: bool,
+    #[arg(long, env = "DFGUARD_PROXY_METRICS_LISTEN")]
+    metrics_listen: Option<String>,
+}
 
-    #[arg(long, env = "DFGUARD_METRICS_LISTEN")]
+#[derive(Parser, Debug, Clone)]
+struct TunnelConfig {
+    #[arg(long, env = "DFGUARD_TUNNEL_LISTEN")]
+    listen: String,
+    #[arg(long, env = "DFGUARD_TUNNEL_UPSTREAM")]
+    upstream: String,
+    #[arg(long, value_name = "FILE", env = "DFGUARD_TUNNEL_CERT")]
+    cert: PathBuf,
+    #[arg(long, value_name = "FILE", env = "DFGUARD_TUNNEL_KEY")]
+    key: PathBuf,
+    #[arg(long, value_name = "FILE", env = "DFGUARD_TUNNEL_CA")]
+    ca: PathBuf,
+    #[arg(long, env = "DFGUARD_TUNNEL_VERIFY_HOST")]
+    verify_host: String,
+    #[arg(long, env = "DFGUARD_TUNNEL_TCP_NODELAY", default_value_t = false)]
+    tcp_nodelay: bool,
+    #[arg(
+        long,
+        env = "DFGUARD_TUNNEL_CONNECT_TIMEOUT_SECS",
+        default_value = "10"
+    )]
+    connect_timeout_secs: u64,
+    #[arg(
+        long,
+        env = "DFGUARD_TUNNEL_SHUTDOWN_TIMEOUT_SECS",
+        default_value = "30"
+    )]
+    shutdown_timeout_secs: u64,
+    #[arg(long, env = "DFGUARD_TUNNEL_METRICS_LISTEN")]
     metrics_listen: Option<String>,
 }
 
@@ -521,11 +567,23 @@ struct PinnedAt {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::parse();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Commands::Proxy(config)) => run_proxy(config).await,
+        Some(Commands::Tunnel(config)) => run_tunnel(config).await,
+        None => {
+            let config = ProxyConfig::parse();
+            run_proxy(config).await
+        }
+    }
+}
+
+async fn run_proxy(config: ProxyConfig) -> Result<()> {
     let mut telemetry = Telemetry::new();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _otel_runtime = init_telemetry(&config, filter, &mut telemetry);
+    let _otel_runtime = init_telemetry_proxy(&config, filter, &mut telemetry);
     let telemetry = Arc::new(telemetry);
 
     let acl = load_acl(&config.acl)?;
@@ -605,13 +663,315 @@ async fn main() -> Result<()> {
     }
 }
 
-fn init_telemetry(config: &Config, filter: EnvFilter, telemetry: &mut Telemetry) -> OTelRuntime {
+async fn run_tunnel(config: TunnelConfig) -> Result<()> {
+    let mut telemetry = Telemetry::new();
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _otel_runtime = init_telemetry_tunnel(&config, filter, &mut telemetry);
+    let telemetry = Arc::new(telemetry);
+
+    let client_config = Arc::new(build_tunnel_client_config(&config)?);
+    let connect_timeout = Duration::from_secs(config.connect_timeout_secs);
+    let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_secs);
+    let tcp_nodelay = config.tcp_nodelay;
+
+    let (upstream_host, upstream_port) = parse_host_port(&config.upstream)?;
+    let upstream_addr = resolve_addr(&config.upstream)?;
+    let server_name = parse_server_name(&config.verify_host)?;
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_clone = shutdown_flag.clone();
+
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("shutdown signal received");
+        shutdown_flag_clone.store(true, Ordering::Relaxed);
+    });
+
+    if let Some(metrics_listen) = &config.metrics_listen {
+        let readiness = Arc::new(AtomicBool::new(false));
+        let readiness_for_server = readiness.clone();
+        let metrics_listen = metrics_listen.clone();
+        tokio::spawn(async move {
+            if let Err(err) = start_metrics_server(&metrics_listen, readiness_for_server).await {
+                error!("metrics server error: {err:#}");
+            }
+        });
+        readiness.store(true, Ordering::Relaxed);
+    }
+
+    let listener = TcpListener::bind(&config.listen)
+        .await
+        .with_context(|| format!("bind listen address {}", config.listen))?;
+
+    info!("tunnel listening on {}", config.listen);
+    info!("tunnel upstream {}:{}", upstream_host, upstream_port);
+
+    let mut connections: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    loop {
+        if shutdown_flag.load(Ordering::Relaxed) {
+            info!("stopping accept loop due to shutdown signal");
+            break;
+        }
+
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((socket, peer_addr)) => {
+                        if tcp_nodelay && let Err(err) = socket.set_nodelay(true) {
+                            debug!("failed to enable downstream TCP_NODELAY: {err}");
+                        }
+                        telemetry.connection_accepted();
+
+                        let client_config = client_config.clone();
+                        let server_name = server_name.clone();
+                        let telemetry = telemetry.clone();
+                        let _shutdown_flag = shutdown_flag.clone();
+
+                        let handle = tokio::spawn(async move {
+                            let span = info_span!("tunnel_connection", peer = %peer_addr);
+                            if let Err(err) = handle_tunnel_connection(
+                                socket,
+                                upstream_addr,
+                                server_name,
+                                client_config,
+                                connect_timeout,
+                                tcp_nodelay,
+                                &telemetry,
+                            )
+                            .instrument(span)
+                            .await
+                            {
+                                error!("tunnel connection error: {err:#}");
+                                telemetry.connection_error("tunnel_connection", "downstream");
+                            }
+                            telemetry.connection_closed();
+                        });
+                        connections.push(handle);
+                    }
+                    Err(err) => {
+                        if shutdown_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        error!("accept error: {err:#}");
+                    }
+                }
+            }
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+
+    info!(
+        "waiting for {} tunnel connections to finish",
+        connections.len()
+    );
+    let shutdown_deadline = tokio::time::Instant::now() + shutdown_timeout;
+    for handle in connections {
+        let remaining = shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("tunnel task panicked: {e:#}"),
+            Err(_) => debug!("tunnel task timed out during shutdown"),
+        }
+    }
+
+    info!("tunnel shutdown complete");
+    Ok(())
+}
+
+async fn handle_tunnel_connection(
+    downstream: TcpStream,
+    upstream_addr: SocketAddr,
+    server_name: ServerName<'static>,
+    client_config: Arc<ClientConfig>,
+    connect_timeout: Duration,
+    tcp_nodelay: bool,
+    telemetry: &Telemetry,
+) -> Result<()> {
+    let tcp_started = tokio::time::Instant::now();
+    let upstream_socket = timeout(connect_timeout, TcpStream::connect(upstream_addr))
+        .instrument(info_span!("tunnel_upstream_tcp_connect"))
+        .await
+        .context("upstream TCP connect timeout")?
+        .inspect_err(|_| {
+            telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "error");
+        })?;
+
+    if tcp_nodelay && let Err(err) = upstream_socket.set_nodelay(true) {
+        debug!("failed to enable upstream TCP_NODELAY: {err}");
+    }
+    telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "success");
+
+    let connector = TlsConnector::from(client_config.clone());
+    let tls_started = tokio::time::Instant::now();
+    debug!(
+        "tunnel attempting TLS handshake to {:?} with SNI {:?}",
+        upstream_addr, server_name
+    );
+    let upstream_tls = timeout(
+        connect_timeout,
+        connector.connect(server_name, upstream_socket),
+    )
+    .instrument(info_span!("tunnel_upstream_tls_handshake"))
+    .await
+    .context("upstream TLS handshake timeout")?
+    .inspect_err(|e| {
+        error!("tunnel TLS handshake failed: {e:#}");
+        telemetry.observe_upstream_tls_handshake_ms(tls_started.elapsed(), "error");
+        telemetry.connection_error("tls_handshake", "upstream");
+    })?;
+    telemetry.observe_upstream_tls_handshake_ms(tls_started.elapsed(), "success");
+
+    debug!("tunnel connected to upstream, starting copy_bidirectional");
+
+    let mut upstream_tls = upstream_tls;
+    let mut downstream = downstream;
+
+    tokio::io::copy_bidirectional(&mut downstream, &mut upstream_tls).await?;
+    Ok(())
+}
+
+fn build_tunnel_client_config(config: &TunnelConfig) -> Result<ClientConfig> {
+    let certs = load_certs(&config.cert)?;
+    let key = load_private_key(&config.key)?;
+    let mut roots = RootCertStore::empty();
+    for cert in load_certs(&config.ca)? {
+        roots.add(cert).context("add tunnel CA")?;
+    }
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .context("build tunnel TLS config")?;
+    Ok(client_config)
+}
+
+fn init_telemetry_proxy(
+    config: &ProxyConfig,
+    filter: EnvFilter,
+    telemetry: &mut Telemetry,
+) -> OTelRuntime {
     let resource = Resource::builder()
         .with_service_name(
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dfguard".to_string()),
         )
         .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
         .with_attribute(KeyValue::new("dfguard.listen", config.listen.clone()))
+        .build();
+
+    let mut tracer_provider = None;
+    let mut meter_provider = None;
+    let mut logger_provider = None;
+
+    let sdk_disabled = std::env::var("OTEL_SDK_DISABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let otlp_configured = has_otel_otlp_endpoint_env();
+
+    if sdk_disabled || !otlp_configured {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .init();
+        return OTelRuntime {
+            _tracer: None,
+            _meter: None,
+            _logger: None,
+        };
+    }
+
+    match opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
+        .map(|exporter| {
+            opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource.clone())
+                .build()
+        }) {
+        Ok(provider) => {
+            global::set_tracer_provider(provider.clone());
+            tracer_provider = Some(provider);
+        }
+        Err(err) => {
+            eprintln!("failed to initialize OTLP trace exporter: {err}");
+        }
+    }
+
+    match opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .build()
+        .map(|exporter| {
+            let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
+            opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                .with_reader(reader)
+                .with_resource(resource.clone())
+                .build()
+        }) {
+        Ok(provider) => {
+            global::set_meter_provider(provider.clone());
+            let meter = provider.meter("dfguard");
+            telemetry.set_otel(Arc::new(build_otel_metrics(&meter)));
+            meter_provider = Some(provider);
+        }
+        Err(err) => {
+            eprintln!("failed to initialize OTLP metrics exporter: {err}");
+        }
+    }
+
+    match opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .build()
+        .map(|exporter| {
+            opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource)
+                .build()
+        }) {
+        Ok(provider) => {
+            logger_provider = Some(provider);
+        }
+        Err(err) => {
+            eprintln!("failed to initialize OTLP logs exporter: {err}");
+        }
+    }
+
+    let tracer_layer = tracer_provider
+        .as_ref()
+        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("dfguard")));
+    let log_layer = logger_provider
+        .as_ref()
+        .map(OpenTelemetryTracingBridge::new);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(tracer_layer)
+        .with(log_layer)
+        .init();
+
+    OTelRuntime {
+        _tracer: tracer_provider,
+        _meter: meter_provider,
+        _logger: logger_provider,
+    }
+}
+
+fn init_telemetry_tunnel(
+    config: &TunnelConfig,
+    filter: EnvFilter,
+    telemetry: &mut Telemetry,
+) -> OTelRuntime {
+    let resource = Resource::builder()
+        .with_service_name(
+            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dfguard".to_string()),
+        )
+        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+        .with_attribute(KeyValue::new("dfguard.mode", "tunnel"))
+        .with_attribute(KeyValue::new("dfguard.listen", config.listen.clone()))
+        .with_attribute(KeyValue::new("dfguard.upstream", config.upstream.clone()))
         .build();
 
     let mut tracer_provider = None;
@@ -865,7 +1225,7 @@ async fn handle_connection(
     socket: TcpStream,
     server_rx: watch::Receiver<Arc<ServerConfig>>,
     acl_rx: watch::Receiver<Arc<HashMap<String, AclEntry>>>,
-    config: Arc<Config>,
+    config: Arc<ProxyConfig>,
     upstream_pool: Arc<UpstreamPool>,
 ) -> Result<()> {
     let server_config = server_rx.borrow().clone();
@@ -1330,7 +1690,7 @@ fn start_acl_watcher(
 }
 
 fn start_tls_watcher(
-    config: Arc<Config>,
+    config: Arc<ProxyConfig>,
     server_tx: watch::Sender<Arc<ServerConfig>>,
     client_tx: watch::Sender<Arc<ClientConfigs>>,
     telemetry: Arc<Telemetry>,
@@ -1715,7 +2075,7 @@ mod tests {
     }
 }
 
-fn build_server_config(config: &Config) -> Result<ServerConfig> {
+fn build_server_config(config: &ProxyConfig) -> Result<ServerConfig> {
     let certs = load_certs(&config.server_cert)?;
     let key = load_private_key(&config.server_key)?;
     let mut roots = RootCertStore::empty();
@@ -1732,7 +2092,7 @@ fn build_server_config(config: &Config) -> Result<ServerConfig> {
     Ok(server_config)
 }
 
-fn build_client_config(config: &Config, disable_resumption: bool) -> Result<ClientConfig> {
+fn build_client_config(config: &ProxyConfig, disable_resumption: bool) -> Result<ClientConfig> {
     let certs = load_certs(&config.upstream_cert)?;
     let key = load_private_key(&config.upstream_key)?;
     let mut roots = RootCertStore::empty();

@@ -9,6 +9,9 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 
+# Benchmark results
+scripts/benchmark/results/
+scripts/benchmark/certs/
 
 # Added by cargo
 

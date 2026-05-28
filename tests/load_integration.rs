@@ -132,7 +132,9 @@ async fn load_profile_mixed_command_classes_and_reset_reauth() {
 }
 
 fn spawn_proxy(pki: &TestPki, listen_addr: &str, upstream_port: u16) -> Child {
+    let stderr_path = format!("/tmp/dfguard_proxy_stderr_{}.log", std::process::id());
     Command::new(env!("CARGO_BIN_EXE_dfguard"))
+        .arg("proxy")
         .arg("--listen")
         .arg(listen_addr)
         .arg("--upstream")
@@ -153,7 +155,14 @@ fn spawn_proxy(pki: &TestPki, listen_addr: &str, upstream_port: u16) -> Child {
         .arg(&pki.ca_cert_path)
         .arg("--insecure-upstream")
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&stderr_path)
+                .expect("open proxy stderr log"),
+        ))
         .spawn()
         .expect("spawn dfguard")
 }
@@ -524,8 +533,16 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         // SAFETY: child pointer is valid for the whole test scope where this guard lives.
         let child = unsafe { &mut *self.child };
+        let stderr = child.stderr.take();
         let _ = child.kill();
         let _ = child.wait();
+        if let Some(mut stderr) = stderr {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut stderr, &mut buf).ok();
+            if !buf.is_empty() {
+                eprintln!("child stderr: {buf}");
+            }
+        }
     }
 }
 
@@ -537,6 +554,8 @@ struct TestPki {
     server_key_path: PathBuf,
     upstream_client_cert_path: PathBuf,
     upstream_client_key_path: PathBuf,
+    downstream_client_cert_path: PathBuf,
+    downstream_client_key_path: PathBuf,
     ca: GeneratedCert,
     downstream_client: GeneratedCert,
     upstream_server: GeneratedCert,
@@ -577,6 +596,16 @@ impl TestPki {
             write_text(dir.path(), "upstream-client.crt", &upstream_client.cert_pem)?;
         let upstream_client_key_path =
             write_text(dir.path(), "upstream-client.key", &upstream_client.key_pem)?;
+        let downstream_client_cert_path = write_text(
+            dir.path(),
+            "downstream-client.crt",
+            &downstream_client.cert_pem,
+        )?;
+        let downstream_client_key_path = write_text(
+            dir.path(),
+            "downstream-client.key",
+            &downstream_client.key_pem,
+        )?;
 
         Ok(Self {
             _dir: dir,
@@ -586,6 +615,8 @@ impl TestPki {
             server_key_path,
             upstream_client_cert_path,
             upstream_client_key_path,
+            downstream_client_cert_path,
+            downstream_client_key_path,
             ca,
             downstream_client,
             upstream_server,
@@ -640,4 +671,122 @@ fn export_generated_cert(cert: &Certificate, key: &KeyPair) -> GeneratedCert {
 
 fn to_io_err(err: impl std::fmt::Display) -> io::Error {
     io::Error::other(err.to_string())
+}
+
+#[tokio::test]
+async fn tunnel_proxy_upstream_full_flow() {
+    let pki = TestPki::generate().expect("generate test PKI");
+
+    let upstream = start_mock_upstream(&pki)
+        .await
+        .expect("start upstream server");
+
+    let proxy_port = free_port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    let mut proxy_child = spawn_proxy(&pki, &proxy_addr, upstream.addr.port());
+    let _proxy_guard = ChildGuard::new(&mut proxy_child);
+
+    let proxy_connector = build_downstream_connector(&pki);
+    wait_for_proxy_ready(&proxy_connector, &proxy_addr)
+        .await
+        .expect("proxy ready");
+
+    eprintln!("proxy ready on {}", proxy_addr);
+
+    let tunnel_port = free_port();
+    let tunnel_addr = format!("127.0.0.1:{tunnel_port}");
+    let mut tunnel_child = spawn_tunnel_for_chain(
+        &pki,
+        &tunnel_addr,
+        "127.0.0.1",
+        proxy_port,
+        proxy_port,
+        "localhost",
+    );
+    let _tunnel_guard = ChildGuard::new(&mut tunnel_child);
+
+    let tunnel_ready = async {
+        for _ in 0..50 {
+            match TcpStream::connect(&tunnel_addr).await {
+                Ok(_) => return true,
+                Err(e) => {
+                    eprintln!("tunnel connection attempt failed: {e}");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    };
+    let tunnel_ready = tokio::time::timeout(Duration::from_secs(5), tunnel_ready)
+        .await
+        .expect("tunnel ready check timed out");
+    assert!(tunnel_ready, "tunnel should be ready");
+
+    eprintln!(
+        "tunnel ready on {}, testing full chain with plain TCP to tunnel",
+        tunnel_addr
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    eprintln!("connecting to tunnel...");
+    let mut tcp = TcpStream::connect(&tunnel_addr)
+        .await
+        .expect("connect to tunnel");
+    eprintln!("connected to tunnel, sending raw PING");
+    tcp.write_all(b"PING\r\n").await.expect("send raw ping");
+    eprintln!("raw ping sent, waiting for response");
+    let mut response = [0u8; 128];
+    let read_result = tcp.read(&mut response).await;
+    eprintln!("read result: {:?}", read_result);
+    match read_result {
+        Ok(n) => {
+            eprintln!(
+                "received {} bytes: {:?}",
+                n,
+                String::from_utf8_lossy(&response[..n])
+            );
+            assert!(response.starts_with(b"+PONG"), "full chain should work");
+            eprintln!("PING succeeded via tunnel->proxy->upstream chain");
+        }
+        Err(e) => {
+            eprintln!("read error: {e}");
+            tunnel_child.kill().ok();
+            let _ = tunnel_child.wait();
+            proxy_child.kill().ok();
+            let _ = proxy_child.wait();
+            panic!("read failed: {e}");
+        }
+    }
+
+    upstream.shutdown();
+}
+
+fn spawn_tunnel_for_chain(
+    pki: &TestPki,
+    listen_addr: &str,
+    upstream_host: &str,
+    _upstream_port: u16,
+    proxy_port: u16,
+    verify_host: &str,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_dfguard"))
+        .arg("tunnel")
+        .arg("--listen")
+        .arg(listen_addr)
+        .arg("--upstream")
+        .arg(format!("{upstream_host}:{proxy_port}"))
+        .arg("--cert")
+        .arg(&pki.downstream_client_cert_path)
+        .arg("--key")
+        .arg(&pki.downstream_client_key_path)
+        .arg("--ca")
+        .arg(&pki.ca_cert_path)
+        .arg("--verify-host")
+        .arg(verify_host)
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn dfguard tunnel")
 }
