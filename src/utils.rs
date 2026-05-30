@@ -23,14 +23,10 @@ pub fn parse_host_port(input: &str) -> Result<(String, u16)> {
 }
 
 pub fn resolve_addr(addr: &str) -> Result<SocketAddr> {
-    let addrs: Vec<SocketAddr> = addr
-        .to_socket_addrs()
+    addr.to_socket_addrs()
         .context("resolve upstream address")?
-        .collect();
-    addrs
-        .into_iter()
-        .find(SocketAddr::is_ipv4)
-        .ok_or_else(|| anyhow!("no IPv4 address resolved"))
+        .next()
+        .ok_or_else(|| anyhow!("no upstream address resolved"))
 }
 
 pub fn parse_server_name(host: &str) -> Result<rustls::pki_types::ServerName<'static>> {
