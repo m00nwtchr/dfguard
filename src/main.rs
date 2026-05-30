@@ -60,7 +60,7 @@ struct Cli {
 #[derive(Parser, Debug, Clone)]
 struct ProxyConfig {
     #[arg(long, env = "DFGUARD_PROXY_LISTEN", default_value = "[::]:6379")]
-    listen: String,
+    listen: SocketAddr,
     #[arg(long, env = "DFGUARD_PROXY_UPSTREAM")]
     upstream: String,
     #[arg(long, value_name = "FILE", env = "DFGUARD_PROXY_ACL")]
@@ -101,8 +101,8 @@ struct ProxyConfig {
 
 #[derive(Parser, Debug, Clone)]
 struct TunnelConfig {
-    #[arg(long, env = "DFGUARD_TUNNEL_LISTEN")]
-    listen: String,
+    #[arg(long, env = "DFGUARD_TUNNEL_LISTEN", default_value = "[::1]:6379")]
+    listen: SocketAddr,
     #[arg(long, env = "DFGUARD_TUNNEL_UPSTREAM")]
     upstream: String,
     #[arg(long, value_name = "FILE", env = "DFGUARD_TUNNEL_CERT")]
@@ -675,7 +675,12 @@ async fn run_tunnel(config: TunnelConfig) -> Result<()> {
 
     let (upstream_host, upstream_port) = parse_host_port(&config.upstream)?;
     let upstream_addr = resolve_addr(&config.upstream)?;
+    info!(
+        "tunnel upstream {}:{} resolved to {:?}",
+        upstream_host, upstream_port, upstream_addr
+    );
     let server_name = parse_server_name(&upstream_host)?;
+    info!("tunnel server name for TLS: {:?}", server_name);
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_clone = shutdown_flag.clone();
@@ -727,8 +732,9 @@ async fn run_tunnel(config: TunnelConfig) -> Result<()> {
                         let _shutdown_flag = shutdown_flag.clone();
 
                         let handle = tokio::spawn(async move {
+                            info!("tunnel spawn PRE: socket={}, upstream_addr={:?}, server_name={:?}", peer_addr, upstream_addr, server_name);
                             let span = info_span!("tunnel_connection", peer = %peer_addr);
-                            if let Err(err) = handle_tunnel_connection(
+                            let result = handle_tunnel_connection(
                                 socket,
                                 upstream_addr,
                                 server_name,
@@ -738,10 +744,15 @@ async fn run_tunnel(config: TunnelConfig) -> Result<()> {
                                 &telemetry,
                             )
                             .instrument(span)
-                            .await
-                            {
-                                error!("tunnel connection error: {err:#}");
-                                telemetry.connection_error("tunnel_connection", "downstream");
+                            .await;
+                            match result {
+                                Ok(()) => {
+                                    info!("tunnel connection completed OK");
+                                }
+                                Err(e) => {
+                                    error!("tunnel connection error: {e:#}");
+                                    telemetry.connection_error("tunnel_connection", "downstream");
+                                }
                             }
                             telemetry.connection_closed();
                         });
@@ -789,14 +800,28 @@ async fn handle_tunnel_connection(
     tcp_nodelay: bool,
     telemetry: &Telemetry,
 ) -> Result<()> {
+    info!(
+        "handle_tunnel_connection CALLED: upstream_addr={:?}, server_name={:?}",
+        upstream_addr, server_name
+    );
     let tcp_started = tokio::time::Instant::now();
     let upstream_socket = timeout(connect_timeout, TcpStream::connect(upstream_addr))
         .instrument(info_span!("tunnel_upstream_tcp_connect"))
-        .await
-        .context("upstream TCP connect timeout")?
-        .inspect_err(|_| {
+        .await;
+    info!("tunnel TCP connect result: {:?}", upstream_socket);
+    let upstream_socket = match upstream_socket {
+        Ok(Ok(socket)) => socket,
+        Ok(Err(e)) => {
+            error!("tunnel TCP connect FAILED (direct): {}", e);
             telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "error");
-        })?;
+            return Err(anyhow::Error::from(e)).context("tunnel upstream TCP connect failed");
+        }
+        Err(e) => {
+            error!("tunnel TCP connect FAILED (timeout): {}", e);
+            telemetry.observe_upstream_tcp_connect_ms(tcp_started.elapsed(), "timeout");
+            return Err(anyhow::Error::from(e)).context("upstream TCP connect timeout");
+        }
+    };
 
     if tcp_nodelay && let Err(err) = upstream_socket.set_nodelay(true) {
         debug!("failed to enable upstream TCP_NODELAY: {err}");
@@ -805,6 +830,10 @@ async fn handle_tunnel_connection(
 
     let connector = TlsConnector::from(client_config.clone());
     let tls_started = tokio::time::Instant::now();
+    info!(
+        "tunnel about to do TLS connect to {:?} with server_name {:?}",
+        upstream_addr, server_name
+    );
     debug!(
         "tunnel attempting TLS handshake to {:?} with SNI {:?}",
         upstream_addr, server_name
@@ -817,18 +846,30 @@ async fn handle_tunnel_connection(
     .await
     .context("upstream TLS handshake timeout")?
     .inspect_err(|e| {
-        error!("tunnel TLS handshake failed: {e:#}");
+        error!("tunnel TLS handshake failed: {:#}", e);
         telemetry.observe_upstream_tls_handshake_ms(tls_started.elapsed(), "error");
         telemetry.connection_error("tls_handshake", "upstream");
-    })?;
+    })
+    .context("tunnel TLS handshake failed")?;
+    debug!("tunnel TLS handshake succeeded");
     telemetry.observe_upstream_tls_handshake_ms(tls_started.elapsed(), "success");
-
-    debug!("tunnel connected to upstream, starting copy_bidirectional");
 
     let mut upstream_tls = upstream_tls;
     let mut downstream = downstream;
 
-    tokio::io::copy_bidirectional(&mut downstream, &mut upstream_tls).await?;
+    info!("tunnel: copy_bidirectional starting");
+    match tokio::io::copy_bidirectional(&mut downstream, &mut upstream_tls).await {
+        Ok((d, u)) => {
+            info!(
+                "tunnel: copy_bidirectional completed normally: downstream->upstream={} bytes, upstream->downstream={} bytes",
+                d, u
+            );
+        }
+        Err(e) => {
+            error!("tunnel: copy_bidirectional error: {:#}", e);
+        }
+    }
+    info!("tunnel: handle_tunnel_connection returning Ok");
     Ok(())
 }
 
@@ -856,7 +897,7 @@ fn init_telemetry_proxy(
             std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "dfguard".to_string()),
         )
         .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
-        .with_attribute(KeyValue::new("dfguard.listen", config.listen.clone()))
+        .with_attribute(KeyValue::new("dfguard.listen", config.listen.to_string()))
         .build();
 
     let mut tracer_provider = None;
@@ -968,7 +1009,7 @@ fn init_telemetry_tunnel(
         )
         .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
         .with_attribute(KeyValue::new("dfguard.mode", "tunnel"))
-        .with_attribute(KeyValue::new("dfguard.listen", config.listen.clone()))
+        .with_attribute(KeyValue::new("dfguard.listen", config.listen.to_string()))
         .with_attribute(KeyValue::new("dfguard.upstream", config.upstream.clone()))
         .build();
 
@@ -1599,10 +1640,14 @@ fn parse_host_port(input: &str) -> Result<(String, u16)> {
 }
 
 fn resolve_addr(addr: &str) -> Result<SocketAddr> {
-    addr.to_socket_addrs()
+    let addrs: Vec<SocketAddr> = addr
+        .to_socket_addrs()
         .context("resolve upstream address")?
-        .next()
-        .ok_or_else(|| anyhow!("no upstream address resolved"))
+        .collect();
+    addrs
+        .into_iter()
+        .find(SocketAddr::is_ipv4)
+        .ok_or_else(|| anyhow!("no IPv4 address resolved"))
 }
 
 fn extract_dns_user(tls: &tokio_rustls::server::TlsStream<TcpStream>) -> Result<String> {
