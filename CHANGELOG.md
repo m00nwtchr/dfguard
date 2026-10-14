@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.2.9
+
+- Fixed forwarding of unsolicited Redis Pub/Sub messages on pinned connections, including RESP3 pushes and multi-channel subscription acknowledgements.
+- Added regression coverage for regular, pattern, and sharded subscriptions, fragmented frames, and RESET reauthentication.
+
 ## 0.2.8
 
 - Switched synchronization on pooled upstream idle connections to `parking_lot::Mutex` and enforced disallowed `std::sync` lock types through clippy configuration.
