@@ -17,9 +17,9 @@ use crate::auth::extract_dns_user;
 use crate::auth::send_auth;
 use crate::cli::ProxyConfig;
 use crate::protocol::{
-    apply_command_state_after_response, apply_command_state_before_send, classify_command,
-    close_reason_from_io_error, idle_timeout_from_secs, parse_command_frame, parse_resp_frame_len,
-    should_reauth_after_reset,
+    PubSubState, apply_command_state_after_response, apply_command_state_before_send,
+    classify_command, close_reason_from_io_error, idle_timeout_from_secs, parse_command_frame,
+    parse_resp_frame_len, should_reauth_after_reset,
 };
 use crate::telemetry::Telemetry;
 use crate::tls::build_client_config;
@@ -187,15 +187,33 @@ pub async fn handle_connection(
     let mut downstream_buf = BytesMut::with_capacity(8192);
     let mut route_state = RouteState::Stateless;
     let max_frame_size = config.max_frame_size;
+    let mut pubsub = PubSubState::default();
 
     loop {
-        let frame_result = read_next_command_frame(
-            &mut downstream,
-            &mut downstream_buf,
-            idle_timeout,
-            max_frame_size,
-        )
-        .await;
+        // Both readers retain partial frames in their buffers, so cancelling the
+        // losing select branch cannot lose bytes. Pinned sessions can receive
+        // publications even when the client has no more commands to send.
+        let frame_result = if let RouteState::Pinned(pinned) = &mut route_state {
+            tokio::select! {
+                result = Box::pin(read_upstream_response(&mut pinned.conn, idle_timeout, max_frame_size)) => {
+                    let response = result?;
+                    pubsub.observe(&response)?;
+                    downstream.write_all(&response).await?;
+                    continue;
+                }
+                result = read_next_command_frame(
+                    &mut downstream, &mut downstream_buf, idle_timeout, max_frame_size,
+                ) => result,
+            }
+        } else {
+            read_next_command_frame(
+                &mut downstream,
+                &mut downstream_buf,
+                idle_timeout,
+                max_frame_size,
+            )
+            .await
+        };
 
         let frame = match frame_result {
             Ok(frame) => frame,
@@ -286,10 +304,16 @@ pub async fn handle_connection(
             apply_command_state_before_send(&mut pinned_conn.state, &frame, class);
             pinned_conn.conn.tls.write_all(&data).await?;
             let started = Instant::now();
-            let response =
-                read_upstream_response(&mut pinned_conn.conn, idle_timeout, max_frame_size)
-                    .instrument(info_span!("upstream_response", route_mode = "pinned"))
-                    .await?;
+            let response = read_command_response(
+                &mut downstream,
+                &mut pinned_conn.conn,
+                &mut pubsub,
+                &frame,
+                idle_timeout,
+                max_frame_size,
+            )
+            .instrument(info_span!("upstream_response", route_mode = "pinned"))
+            .await?;
             upstream_pool
                 .telemetry
                 .observe_upstream_roundtrip_ms(&frame.command, started.elapsed());
@@ -300,6 +324,7 @@ pub async fn handle_connection(
             apply_command_state_after_response(&mut pinned_conn.state, &frame, class, &response);
 
             if should_reauth_after_reset(&frame, &response) {
+                pubsub = PubSubState::default();
                 upstream_pool.telemetry.reauth_after_reset_attempt();
                 let reauth_started = Instant::now();
                 match send_auth(&mut pinned_conn.conn.tls, &key.user, password.as_deref())
@@ -609,5 +634,58 @@ async fn read_upstream_response(
         if upstream.read_buf.len() > max_frame_size {
             bail!("response buffer exceeds max size");
         }
+    }
+}
+
+// A subscription command can produce multiple acknowledgements, and pushes can
+// appear before any command's reply. Never treat those pushes as its response.
+async fn read_command_response(
+    downstream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    upstream: &mut UpstreamConn,
+    pubsub: &mut PubSubState,
+    frame: &FrameInfo,
+    idle_timeout: Option<Duration>,
+    max_frame_size: usize,
+) -> Result<BytesMut> {
+    let mut remaining = pubsub.reply_count(frame);
+    loop {
+        let response = read_upstream_response(upstream, idle_timeout, max_frame_size).await?;
+        // RESP2 arrays are Pub/Sub events only in a subscription context;
+        // ordinary array-valued replies may also start with "message".
+        let event = if pubsub.has_resp2_subscriptions()
+            || (!pubsub.uses_resp3() && PubSubState::is_subscription_command(frame))
+            || response.first() == Some(&b'>')
+        {
+            pubsub.observe(&response)?
+        } else {
+            None
+        };
+        let acknowledgement = event
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case(&frame.command));
+        let unsolicited = response.first() == Some(&b'>')
+            || event.as_deref().is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "message"
+                        | "pmessage"
+                        | "smessage"
+                        | "subscribe"
+                        | "psubscribe"
+                        | "ssubscribe"
+                        | "unsubscribe"
+                        | "punsubscribe"
+                        | "sunsubscribe"
+                )
+            });
+        if acknowledgement {
+            remaining -= 1;
+            if remaining == 0 {
+                return Ok(response);
+            }
+        } else if !unsolicited {
+            return Ok(response);
+        }
+        downstream.write_all(&response).await?;
     }
 }

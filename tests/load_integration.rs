@@ -779,3 +779,178 @@ fn spawn_tunnel_for_chain(
         .spawn()
         .expect("spawn dfguard tunnel")
 }
+
+// Script the Redis side of a real mTLS proxy connection. Publications are sent
+// without any client command, including while a downstream command is partial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pubsub_forwards_unsolicited_messages_and_preserves_reset_auth() {
+    for resp3 in [false, true] {
+        for (subscribe, unsubscribe, message) in [
+            ("SUBSCRIBE", "UNSUBSCRIBE", "message"),
+            ("PSUBSCRIBE", "PUNSUBSCRIBE", "pmessage"),
+            ("SSUBSCRIBE", "SUNSUBSCRIBE", "smessage"),
+        ] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let pki = TestPki::generate().unwrap();
+                let config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(
+                        vec![CertificateDer::from(pki.upstream_server.cert_der.clone())],
+                        PrivateKeyDer::from(PrivatePkcs8KeyDer::from(
+                            pki.upstream_server.key_der.clone(),
+                        )),
+                    )
+                    .unwrap();
+                let acceptor = TlsAcceptor::from(Arc::new(config));
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let upstream_port = listener.local_addr().unwrap().port();
+                let proxy_addr = format!("127.0.0.1:{}", free_port());
+                let mut child = spawn_proxy(&pki, &proxy_addr, upstream_port);
+                let _guard = ChildGuard::new(&mut child);
+                let connector = build_downstream_connector(&pki);
+                wait_for_proxy_ready(&connector, &proxy_addr).await.unwrap();
+                let (publish_tx, publish_rx) = oneshot::channel();
+                let publication = pubsub_frame(resp3, message, "Chan0", None);
+                let server_publication = publication.clone();
+                let pong: &[u8] = if resp3 {
+                    b"+PONG\r\n"
+                } else {
+                    b"*2\r\n$4\r\npong\r\n$0\r\n\r\n"
+                };
+                let server = tokio::spawn(async move {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let mut tls = acceptor.accept(tcp).await.unwrap();
+                    expect_upstream_command(&mut tls, "AUTH").await;
+                    tls.write_all(b"+OK\r\n").await.unwrap();
+                    let command = read_resp_array(&mut tls).await.unwrap().unwrap();
+                    assert_eq!(uppercase(&command[0]), subscribe);
+                    assert_eq!(command.len(), 11);
+                    for i in 0..10 {
+                        tls.write_all(&pubsub_frame(
+                            resp3,
+                            &subscribe.to_lowercase(),
+                            &format!("Chan{i}"),
+                            Some(i + 1),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    publish_rx.await.unwrap();
+                    // Deliberately split an upstream frame across writes.
+                    tls.write_all(&server_publication[..5]).await.unwrap();
+                    tokio::task::yield_now().await;
+                    tls.write_all(&server_publication[5..]).await.unwrap();
+                    expect_upstream_command(&mut tls, "PING").await;
+                    // A publication must not be mistaken for the PING reply.
+                    tls.write_all(&server_publication).await.unwrap();
+                    tls.write_all(pong).await.unwrap();
+                    if resp3 {
+                        expect_upstream_command(&mut tls, "EVAL").await;
+                        // An ordinary array reply that resembles a RESP2 publication.
+                        tls.write_all(&pubsub_frame(false, "message", "Chan0", None))
+                            .await
+                            .unwrap();
+                    }
+                    expect_upstream_command(&mut tls, unsubscribe).await;
+                    for i in 0..10 {
+                        tls.write_all(&pubsub_frame(
+                            resp3,
+                            &unsubscribe.to_lowercase(),
+                            &format!("Chan{i}"),
+                            Some(9 - i),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    expect_upstream_command(&mut tls, "RESET").await;
+                    tls.write_all(b"+RESET\r\n").await.unwrap();
+                    expect_upstream_command(&mut tls, "AUTH").await;
+                    tls.write_all(b"+OK\r\n").await.unwrap();
+                    expect_upstream_command(&mut tls, "PING").await;
+                    tls.write_all(b"+PONG\r\n").await.unwrap();
+                });
+                let tcp = TcpStream::connect(&proxy_addr).await.unwrap();
+                let mut tls = connector
+                    .connect(ServerName::try_from("localhost").unwrap().to_owned(), tcp)
+                    .await
+                    .unwrap();
+                let names: Vec<_> = (0..10).map(|i| format!("Chan{i}")).collect();
+                let mut command = vec![subscribe];
+                command.extend(names.iter().map(String::as_str));
+                send_resp_command(&mut tls, &command).await.unwrap();
+                for (i, name) in names.iter().enumerate() {
+                    expect_bytes(
+                        &mut tls,
+                        &pubsub_frame(resp3, &subscribe.to_lowercase(), name, Some(i + 1)),
+                    )
+                    .await;
+                }
+                tls.write_all(b"*1\r\n$4\r\nPI").await.unwrap();
+                publish_tx.send(()).unwrap();
+                expect_bytes(&mut tls, &publication).await;
+                tls.write_all(b"NG\r\n").await.unwrap();
+                expect_bytes(&mut tls, &publication).await;
+                expect_bytes(&mut tls, pong).await;
+                if resp3 {
+                    send_resp_command(
+                        &mut tls,
+                        &["EVAL", "return {'message','Chan0','hello'}", "0"],
+                    )
+                    .await
+                    .unwrap();
+                    expect_bytes(&mut tls, &pubsub_frame(false, "message", "Chan0", None)).await;
+                }
+                send_resp_command(&mut tls, &["AUTH", "other-user"])
+                    .await
+                    .unwrap();
+                expect_bytes(&mut tls, b"-ERR AUTH disabled by proxy\r\n").await;
+                // Pipeline RESET: all unsubscribe acks must be drained first.
+                send_resp_command(&mut tls, &[unsubscribe]).await.unwrap();
+                send_resp_command(&mut tls, &["RESET"]).await.unwrap();
+                for (i, name) in names.iter().enumerate() {
+                    expect_bytes(
+                        &mut tls,
+                        &pubsub_frame(resp3, &unsubscribe.to_lowercase(), name, Some(9 - i)),
+                    )
+                    .await;
+                }
+                expect_bytes(&mut tls, b"+RESET\r\n").await;
+                send_resp_command(&mut tls, &["PING"]).await.unwrap();
+                expect_bytes(&mut tls, b"+PONG\r\n").await;
+                server.await.unwrap();
+            })
+            .await
+            .expect("Pub/Sub session stalled");
+        }
+    }
+}
+
+fn pubsub_frame(resp3: bool, kind: &str, channel: &str, count: Option<usize>) -> Vec<u8> {
+    let marker = if resp3 { '>' } else { '*' };
+    let elements = if kind == "pmessage" { 4 } else { 3 };
+    let mut frame = format!(
+        "{marker}{elements}\r\n${}\r\n{kind}\r\n${}\r\n{channel}\r\n",
+        kind.len(),
+        channel.len()
+    );
+    if kind == "pmessage" {
+        frame.push_str("$6\r\nactual\r\n");
+    }
+    if let Some(count) = count {
+        frame.push_str(&format!(":{count}\r\n"));
+    } else {
+        frame.push_str("$5\r\nhello\r\n");
+    }
+    frame.into_bytes()
+}
+
+async fn expect_upstream_command<S: AsyncRead + Unpin>(stream: &mut S, expected: &str) {
+    let command = read_resp_array(stream).await.unwrap().unwrap();
+    assert_eq!(uppercase(&command[0]), expected);
+}
+
+async fn expect_bytes<S: AsyncRead + Unpin>(stream: &mut S, expected: &[u8]) {
+    let mut actual = vec![0; expected.len()];
+    stream.read_exact(&mut actual).await.unwrap();
+    assert_eq!(actual, expected);
+}

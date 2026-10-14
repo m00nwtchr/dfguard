@@ -29,7 +29,7 @@ pub fn parse_inline_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
     let cmd = iter.next().ok_or_else(|| anyhow!("empty inline command"))?;
     let is_auth = cmd.eq_ignore_ascii_case(b"AUTH");
     let command = to_upper_ascii_string(cmd);
-    let args = iter.take(8).map(to_upper_ascii_string).collect();
+    let args = iter.map(to_upper_ascii_string).collect();
     Ok(Some(FrameInfo {
         len: line_end + 2,
         is_auth,
@@ -76,7 +76,7 @@ pub fn parse_array_frame(buf: &BytesMut) -> Result<Option<FrameInfo>> {
             let cmd = &buf[idx..idx + bulk_len];
             is_auth = cmd.eq_ignore_ascii_case(b"AUTH");
             command = to_upper_ascii_string(cmd);
-        } else if args.len() < 8 {
+        } else {
             args.push(to_upper_ascii_string(&buf[idx..idx + bulk_len]));
         }
         idx += bulk_len + 2;
@@ -184,9 +184,8 @@ pub fn classify_command(frame: &FrameInfo) -> CommandClass {
     let cmd = frame.command.as_str();
     match cmd {
         "MULTI" | "WATCH" | "UNWATCH" | "EXEC" | "DISCARD" | "RESET" => CommandClass::PinTemporary,
-        "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" | "MONITOR" | "SELECT" => {
-            CommandClass::PinForever
-        }
+        "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" | "UNSUBSCRIBE" | "PUNSUBSCRIBE"
+        | "SUNSUBSCRIBE" | "MONITOR" | "SELECT" => CommandClass::PinForever,
         "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "BZPOPMIN" | "BZPOPMAX" => {
             CommandClass::PinWhileBlocking
         }
@@ -514,5 +513,110 @@ mod tests {
             idle_timeout_from_secs(300),
             Some(std::time::Duration::from_secs(300))
         );
+    }
+}
+
+/// Track acknowledged subscriptions, including binary/case-sensitive names.
+/// Counts are needed for argument-less unsubscribe, which replies once per name.
+#[derive(Default)]
+pub struct PubSubState {
+    resp3: bool,
+    channels: std::collections::HashSet<Vec<u8>>,
+    patterns: std::collections::HashSet<Vec<u8>>,
+    shards: std::collections::HashSet<Vec<u8>>,
+}
+
+impl PubSubState {
+    pub fn has_resp2_subscriptions(&self) -> bool {
+        !self.resp3
+            && (!self.channels.is_empty() || !self.patterns.is_empty() || !self.shards.is_empty())
+    }
+
+    pub fn uses_resp3(&self) -> bool {
+        self.resp3
+    }
+
+    pub fn is_subscription_command(frame: &FrameInfo) -> bool {
+        matches!(
+            frame.command.as_str(),
+            "SUBSCRIBE"
+                | "PSUBSCRIBE"
+                | "SSUBSCRIBE"
+                | "UNSUBSCRIBE"
+                | "PUNSUBSCRIBE"
+                | "SUNSUBSCRIBE"
+        )
+    }
+
+    pub fn reply_count(&self, frame: &FrameInfo) -> usize {
+        match frame.command.as_str() {
+            "SUBSCRIBE" | "PSUBSCRIBE" | "SSUBSCRIBE" => frame.args.len().max(1),
+            "UNSUBSCRIBE" | "PUNSUBSCRIBE" | "SUNSUBSCRIBE" => {
+                if !frame.args.is_empty() {
+                    return frame.args.len();
+                }
+                match frame.command.as_str() {
+                    "UNSUBSCRIBE" => self.channels.len(),
+                    "PUNSUBSCRIBE" => self.patterns.len(),
+                    _ => self.shards.len(),
+                }
+                .max(1)
+            }
+            _ => 1,
+        }
+    }
+
+    pub fn observe(&mut self, response: &[u8]) -> Result<Option<String>> {
+        if !matches!(response.first(), Some(b'*' | b'>')) {
+            return Ok(None);
+        }
+        let Some(header) = find_crlf(response) else {
+            return Ok(None);
+        };
+        let count = parse_number(&response[1..header])?;
+        if count < 1 {
+            return Ok(None);
+        }
+        let mut offset = header + 2;
+        let Some(kind) = response_string(response, &mut offset)? else {
+            return Ok(None);
+        };
+        let kind = String::from_utf8_lossy(&kind).into_owned();
+        let subscriptions = match kind.as_str() {
+            "subscribe" | "unsubscribe" => &mut self.channels,
+            "psubscribe" | "punsubscribe" => &mut self.patterns,
+            "ssubscribe" | "sunsubscribe" => &mut self.shards,
+            _ => return Ok(Some(kind)),
+        };
+        self.resp3 = response.first() == Some(&b'>');
+        if count >= 2
+            && let Some(channel) = response_string(response, &mut offset)?
+        {
+            if matches!(kind.as_str(), "subscribe" | "psubscribe" | "ssubscribe") {
+                subscriptions.insert(channel);
+            } else {
+                subscriptions.remove(&channel);
+            }
+        }
+        Ok(Some(kind))
+    }
+}
+
+fn response_string(response: &[u8], offset: &mut usize) -> Result<Option<Vec<u8>>> {
+    let start = *offset;
+    let Some(len) = parse_resp_frame_len_from(response, start)? else {
+        return Ok(None);
+    };
+    *offset += len;
+    match response[start] {
+        b'+' => Ok(Some(response[start + 1..start + len - 2].to_vec())),
+        b'$' => {
+            let header = find_crlf_from(response, start + 1).context("missing bulk header")?;
+            if parse_number(&response[start + 1..header])? < 0 {
+                return Ok(None);
+            }
+            Ok(Some(response[header + 2..start + len - 2].to_vec()))
+        }
+        _ => Ok(None),
     }
 }
