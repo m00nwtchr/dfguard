@@ -1,14 +1,17 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, MeterProvider, UpDownCounter};
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::{WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use std::sync::atomic::Ordering;
+use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -380,96 +383,7 @@ pub fn init_telemetry_proxy(
         .with_attribute(KeyValue::new("dfguard.listen", config.listen.to_string()))
         .build();
 
-    let mut tracer_provider = None;
-    let mut meter_provider = None;
-    let mut logger_provider = None;
-
-    let sdk_disabled = std::env::var("OTEL_SDK_DISABLED")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    let otlp_configured = has_otel_otlp_endpoint_env();
-
-    if sdk_disabled || !otlp_configured {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(tracing_subscriber::fmt::layer().with_target(false))
-            .init();
-        return OTelRuntime {
-            _tracer: None,
-            _meter: None,
-            _logger: None,
-        };
-    }
-
-    let _opentelemetry_otlp = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .build()
-        .map(|exporter| {
-            opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
-                .with_resource(resource.clone())
-                .build()
-        })
-        .and_then(|provider| {
-            opentelemetry::global::set_tracer_provider(provider.clone());
-            tracer_provider = Some(provider.clone());
-            Ok(provider)
-        })
-        .ok();
-
-    let _opentelemetry_otlp = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .build()
-        .map(|exporter| {
-            let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
-            opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-                .with_reader(reader)
-                .with_resource(resource.clone())
-                .build()
-        })
-        .and_then(|provider| {
-            opentelemetry::global::set_meter_provider(provider.clone());
-            let meter = provider.meter("dfguard");
-            telemetry.set_otel(Arc::new(build_otel_metrics(&meter)));
-            meter_provider = Some(provider.clone());
-            Ok(provider)
-        })
-        .ok();
-
-    let _opentelemetry_otlp = opentelemetry_otlp::LogExporter::builder()
-        .with_tonic()
-        .build()
-        .map(|exporter| {
-            opentelemetry_sdk::logs::SdkLoggerProvider::builder()
-                .with_batch_exporter(exporter)
-                .with_resource(resource)
-                .build()
-        })
-        .and_then(|provider| {
-            logger_provider = Some(provider.clone());
-            Ok(provider)
-        })
-        .ok();
-
-    let tracer_layer = tracer_provider
-        .as_ref()
-        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("dfguard")));
-    let log_layer = logger_provider
-        .as_ref()
-        .map(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new);
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
-        .with(tracer_layer)
-        .with(log_layer)
-        .init();
-
-    OTelRuntime {
-        _tracer: tracer_provider,
-        _meter: meter_provider,
-        _logger: logger_provider,
-    }
+    init_telemetry(resource, filter, telemetry)
 }
 
 pub fn init_telemetry_tunnel(
@@ -487,16 +401,16 @@ pub fn init_telemetry_tunnel(
         .with_attribute(KeyValue::new("dfguard.upstream", config.upstream.clone()))
         .build();
 
-    let mut tracer_provider = None;
-    let mut meter_provider = None;
-    let mut logger_provider = None;
+    init_telemetry(resource, filter, telemetry)
+}
 
-    let sdk_disabled = std::env::var("OTEL_SDK_DISABLED")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-    let otlp_configured = has_otel_otlp_endpoint_env();
-
-    if sdk_disabled || !otlp_configured {
+fn init_telemetry(resource: Resource, filter: EnvFilter, telemetry: &mut Telemetry) -> OTelRuntime {
+    let sdk_disabled = std::env::var("OTEL_SDK_DISABLED").is_ok_and(|value| value == "true");
+    if sdk_disabled
+        || !["TRACES", "METRICS", "LOGS"]
+            .iter()
+            .any(|signal| otlp_setting(signal, "ENDPOINT").is_some())
+    {
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().with_target(false))
@@ -508,61 +422,56 @@ pub fn init_telemetry_tunnel(
         };
     }
 
-    let _opentelemetry_otlp = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .build()
-        .map(|exporter| {
-            opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
-                .with_resource(resource.clone())
-                .build()
-        })
-        .and_then(|provider| {
-            opentelemetry::global::set_tracer_provider(provider.clone());
-            tracer_provider = Some(provider.clone());
-            Ok(provider)
-        })
-        .ok();
+    let tracer_provider = configure_otlp(
+        opentelemetry_otlp::SpanExporter::builder().with_tonic(),
+        "TRACES",
+    )
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|exporter| {
+        SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(resource.clone())
+            .build()
+    })
+    .inspect(|provider| opentelemetry::global::set_tracer_provider(provider.clone()));
 
-    let _opentelemetry_otlp = opentelemetry_otlp::MetricExporter::builder()
-        .with_tonic()
-        .build()
-        .map(|exporter| {
-            let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
-            opentelemetry_sdk::metrics::SdkMeterProvider::builder()
-                .with_reader(reader)
-                .with_resource(resource.clone())
-                .build()
-        })
-        .and_then(|provider| {
-            opentelemetry::global::set_meter_provider(provider.clone());
-            let meter = provider.meter("dfguard");
-            telemetry.set_otel(Arc::new(build_otel_metrics(&meter)));
-            meter_provider = Some(provider.clone());
-            Ok(provider)
-        })
-        .ok();
+    let meter_provider = configure_otlp(
+        opentelemetry_otlp::MetricExporter::builder().with_tonic(),
+        "METRICS",
+    )
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|exporter| {
+        let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter).build();
+        SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_resource(resource.clone())
+            .build()
+    })
+    .inspect(|provider| {
+        opentelemetry::global::set_meter_provider(provider.clone());
+        let meter = provider.meter("dfguard");
+        telemetry.set_otel(Arc::new(build_otel_metrics(&meter)));
+    });
 
-    let _opentelemetry_otlp = opentelemetry_otlp::LogExporter::builder()
-        .with_tonic()
-        .build()
-        .map(|exporter| {
-            opentelemetry_sdk::logs::SdkLoggerProvider::builder()
-                .with_batch_exporter(exporter)
-                .with_resource(resource)
-                .build()
-        })
-        .and_then(|provider| {
-            logger_provider = Some(provider.clone());
-            Ok(provider)
-        })
-        .ok();
+    let logger_provider = configure_otlp(
+        opentelemetry_otlp::LogExporter::builder().with_tonic(),
+        "LOGS",
+    )
+    .and_then(|builder| builder.build().map_err(Into::into))
+    .map(|exporter| {
+        SdkLoggerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(resource)
+            .build()
+    });
 
     let tracer_layer = tracer_provider
         .as_ref()
+        .ok()
         .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("dfguard")));
     let log_layer = logger_provider
         .as_ref()
+        .ok()
         .map(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new);
 
     tracing_subscriber::registry()
@@ -572,24 +481,80 @@ pub fn init_telemetry_tunnel(
         .with(log_layer)
         .init();
 
+    for (signal, error) in [
+        ("traces", tracer_provider.as_ref().err()),
+        ("metrics", meter_provider.as_ref().err()),
+        ("logs", logger_provider.as_ref().err()),
+    ] {
+        if let Some(error) = error {
+            tracing::warn!(signal, error = %format_args!("{error:#}"), "failed to initialise OTLP exporter");
+        }
+    }
+
     OTelRuntime {
-        _tracer: tracer_provider,
-        _meter: meter_provider,
-        _logger: logger_provider,
+        _tracer: tracer_provider.ok(),
+        _meter: meter_provider.ok(),
+        _logger: logger_provider.ok(),
     }
 }
 
-fn has_otel_otlp_endpoint_env() -> bool {
-    [
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-    ]
-    .iter()
-    .any(|name| {
+fn configure_otlp<B: WithExportConfig + WithTonicConfig>(builder: B, signal: &str) -> Result<B> {
+    let endpoint =
+        otlp_setting(signal, "ENDPOINT").unwrap_or_else(|| "http://localhost:4317".to_owned());
+    let (scheme, target) = match endpoint.split_once("://") {
+        Some((scheme, target)) if scheme.eq_ignore_ascii_case("http") => ("http", target),
+        Some((scheme, target)) if scheme.eq_ignore_ascii_case("https") => ("https", target),
+        Some(_) => bail!("OTLP endpoint must use http or https"),
+        None => {
+            let insecure = otlp_setting(signal, "INSECURE")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+            (if insecure { "http" } else { "https" }, endpoint.as_str())
+        }
+    };
+
+    let endpoint = format!("{scheme}://{target}");
+    let uri: http::Uri = endpoint.parse().context("invalid OTLP endpoint URL")?;
+    let host = uri.host().context("OTLP endpoint URL has no host")?;
+    let builder = builder.with_endpoint(endpoint);
+    if scheme == "http" {
+        return Ok(builder);
+    }
+
+    // Tonic needs explicit TLS configuration here and an unbracketed IPv6 address.
+    let mut tls =
+        ClientTlsConfig::new().domain_name(host.trim_start_matches('[').trim_end_matches(']'));
+    tls = match otlp_setting(signal, "CERTIFICATE") {
+        Some(path) => tls.ca_certificate(Certificate::from_pem(read_otlp_pem(&path)?)),
+        None => tls.with_native_roots(),
+    };
+
+    match (
+        otlp_setting(signal, "CLIENT_CERTIFICATE"),
+        otlp_setting(signal, "CLIENT_KEY"),
+    ) {
+        (Some(cert), Some(key)) => {
+            tls = tls.identity(Identity::from_pem(
+                read_otlp_pem(&cert)?,
+                read_otlp_pem(&key)?,
+            ));
+        }
+        (None, None) => {}
+        _ => bail!("OTLP mTLS requires both CLIENT_CERTIFICATE and CLIENT_KEY"),
+    }
+
+    Ok(builder.with_tls_config(tls))
+}
+
+fn otlp_setting(signal: &str, setting: &str) -> Option<String> {
+    let read = |name: &str| {
         std::env::var(name)
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false)
-    })
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    read(&format!("OTEL_EXPORTER_OTLP_{signal}_{setting}"))
+        .or_else(|| read(&format!("OTEL_EXPORTER_OTLP_{setting}")))
+}
+
+fn read_otlp_pem(path: &str) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("failed to read OTLP TLS file {path}"))
 }
