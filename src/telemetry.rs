@@ -525,7 +525,7 @@ fn configure_otlp<B: WithExportConfig + WithTonicConfig>(builder: B, signal: &st
         ClientTlsConfig::new().domain_name(host.trim_start_matches('[').trim_end_matches(']'));
     tls = match otlp_setting(signal, "CERTIFICATE") {
         Some(path) => tls.ca_certificate(Certificate::from_pem(read_otlp_pem(&path)?)),
-        None => tls.with_native_roots(),
+        None => tls.with_webpki_roots(),
     };
 
     match (
