@@ -144,7 +144,7 @@ pub async fn run_tunnel(config: TunnelConfig) -> Result<()> {
     info!("tunnel listening on {}", config.listen);
     info!("tunnel upstream {}:{}", upstream_host, upstream_port);
 
-    let mut connections: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
             info!("stopping accept loop due to shutdown signal");
@@ -152,6 +152,11 @@ pub async fn run_tunnel(config: TunnelConfig) -> Result<()> {
         }
 
         tokio::select! {
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = result {
+                    error!("tunnel task panicked: {err:#}");
+                }
+            }
             result = listener.accept() => {
                 match result {
                     Ok((socket, peer_addr)) => {
@@ -165,7 +170,7 @@ pub async fn run_tunnel(config: TunnelConfig) -> Result<()> {
                         let telemetry = telemetry.clone();
                         let _shutdown_flag = shutdown_flag.clone();
 
-                        let handle = tokio::spawn(async move {
+                        connections.spawn(async move {
                             info!("tunnel spawn PRE: socket={}, upstream_addr={:?}, server_name={:?}", peer_addr, upstream_addr, server_name);
                             let span = tracing::info_span!("tunnel_connection", peer = %peer_addr);
                             let result = handle_tunnel_connection(
@@ -190,7 +195,6 @@ pub async fn run_tunnel(config: TunnelConfig) -> Result<()> {
                             }
                             telemetry.connection_closed();
                         });
-                        connections.push(handle);
                     }
                     Err(err) => {
                         if shutdown_flag.load(Ordering::Relaxed) {
@@ -209,14 +213,14 @@ pub async fn run_tunnel(config: TunnelConfig) -> Result<()> {
         connections.len()
     );
     let shutdown_deadline = tokio::time::Instant::now() + shutdown_timeout;
-    for handle in connections {
+    while !connections.is_empty() {
         let remaining = shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break;
         }
-        match tokio::time::timeout(remaining, handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::error!("tunnel task panicked: {e:#}"),
+        match tokio::time::timeout(remaining, connections.join_next()).await {
+            Ok(Some(Ok(())) | None) => {}
+            Ok(Some(Err(e))) => tracing::error!("tunnel task panicked: {e:#}"),
             Err(_) => debug!("tunnel task timed out during shutdown"),
         }
     }

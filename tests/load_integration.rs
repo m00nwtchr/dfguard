@@ -954,3 +954,85 @@ async fn expect_bytes<S: AsyncRead + Unpin>(stream: &mut S, expected: &[u8]) {
     stream.read_exact(&mut actual).await.unwrap();
     assert_eq!(actual, expected);
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_reaps_completed_connections_before_shutdown() {
+    let pki = TestPki::generate().expect("generate test PKI");
+    // Refused upstream connections finish promptly, exercising connection churn.
+    let unused_port = free_port();
+    let tunnel_addr = format!("127.0.0.1:{}", free_port());
+    let log = tempfile::NamedTempFile::new().expect("create log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dfguard"))
+        .args([
+            "tunnel",
+            "--listen",
+            &tunnel_addr,
+            "--upstream",
+            &format!("127.0.0.1:{unused_port}"),
+        ])
+        .arg("--cert")
+        .arg(&pki.downstream_client_cert_path)
+        .arg("--key")
+        .arg(&pki.downstream_client_key_path)
+        .arg("--ca")
+        .arg(&pki.ca_cert_path)
+        .env("RUST_LOG", "info")
+        .env("OTEL_SDK_DISABLED", "true")
+        .stdout(Stdio::from(log.reopen().expect("open log")))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tunnel");
+    let _guard = ChildGuard::new(&mut child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for _ in 0..20 {
+        loop {
+            match TcpStream::connect(&tunnel_addr).await {
+                Ok(socket) => {
+                    drop(socket);
+                    break;
+                }
+                Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(10)).await,
+                Err(e) => panic!("tunnel did not start: {e}"),
+            }
+        }
+    }
+    loop {
+        let contents = std::fs::read_to_string(log.path()).expect("read log");
+        if contents.matches("tunnel connection error:").count() >= 20 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "connections did not finish");
+        sleep(Duration::from_millis(10)).await;
+    }
+    // Allow the accept loop to reap the final completed task while idle.
+    sleep(Duration::from_millis(300)).await;
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("signal tunnel")
+            .success()
+    );
+    let status = loop {
+        if let Some(exit) = child.try_wait().expect("wait for tunnel") {
+            break exit;
+        }
+        assert!(Instant::now() < deadline, "tunnel did not shut down");
+        sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "tunnel should exit cleanly after shutdown"
+    );
+    let contents = std::fs::read_to_string(log.path()).expect("read log");
+    assert!(
+        contents.contains("waiting for 0 tunnel connections to finish"),
+        "completed tasks were retained: {contents}"
+    );
+    assert!(
+        contents.contains("tunnel shutdown complete"),
+        "tunnel did not finish shutdown: {contents}"
+    );
+}
