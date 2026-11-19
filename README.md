@@ -100,7 +100,8 @@ Common OTEL environment variables:
   or TLS with `https://otel-collector:4317`. For a bare `host:port` endpoint,
   TLS is used unless `OTEL_EXPORTER_OTLP_INSECURE=true`.
 - `OTEL_EXPORTER_OTLP_CERTIFICATE` points to a trusted CA PEM file for TLS.
-  If unset, the exporter uses the system trust store.
+  If unset, the exporter uses its bundled webpki root certificates. A
+  configured CA replaces the bundled roots (they are not merged).
 - `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` and `OTEL_EXPORTER_OTLP_CLIENT_KEY`
   point to PEM files for mTLS. Set both to enable client authentication.
 - `OTEL_SERVICE_NAME` (defaults to `dfguard`)

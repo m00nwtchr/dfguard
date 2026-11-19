@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Added optional TLS support for OTLP gRPC exporters: `https://` endpoints (or bare `host:port` endpoints unless `OTEL_EXPORTER_OTLP_INSECURE=true`), a custom CA via `OTEL_EXPORTER_OTLP_CERTIFICATE`, and mTLS client identity via `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`/`OTEL_EXPORTER_OTLP_CLIENT_KEY`, with per-signal overrides. Without a configured CA the exporter uses its bundled webpki root certificates.
+
 ## 0.2.9
 
 - Fixed forwarding of unsolicited Redis Pub/Sub messages on pinned connections, including RESP3 pushes and multi-channel subscription acknowledgements.
