@@ -96,9 +96,20 @@ CLI flags override environment variables.
 
 Common OTEL environment variables:
 
-- `OTEL_EXPORTER_OTLP_ENDPOINT` (for example `http://otel-collector:4317`)
+- `OTEL_EXPORTER_OTLP_ENDPOINT` selects plaintext with `http://otel-collector:4317`
+  or TLS with `https://otel-collector:4317`. For a bare `host:port` endpoint,
+  TLS is used unless `OTEL_EXPORTER_OTLP_INSECURE=true`.
+- `OTEL_EXPORTER_OTLP_CERTIFICATE` points to a trusted CA PEM file for TLS.
+  If unset, the exporter uses its bundled webpki root certificates. A
+  configured CA replaces the bundled roots (they are not merged).
+- `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` and `OTEL_EXPORTER_OTLP_CLIENT_KEY`
+  point to PEM files for mTLS. Set both to enable client authentication.
 - `OTEL_SERVICE_NAME` (defaults to `dfguard`)
 - `OTEL_SDK_DISABLED=true` to disable OTEL initialization
+
+Per-signal settings take precedence over shared settings. For example,
+`OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE` overrides the shared CA for traces.
+The same overrides are available for `METRICS` and `LOGS`.
 
 Probe endpoints are exposed only when `DFGUARD_METRICS_LISTEN` is set:
 

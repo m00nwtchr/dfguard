@@ -15,6 +15,7 @@ lto = "fat"
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+http = "1"
 notify = "6"
 pem = "3"
 rustls = "0.23"
@@ -26,8 +27,12 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace", "metrics", "logs"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "tls-aws-lc", "trace", "metrics", "logs"] }
 opentelemetry-appender-tracing = "0.31"
+# Direct dependency to enable tonic's bundled webpki roots: opentelemetry-otlp's
+# own `tls-webpki-roots` feature also enables `tls-ring`, which would leave
+# rustls with two crypto providers (ring + aws-lc-rs) next to `tls-aws-lc`.
+tonic = { version = "0.14", default-features = false, features = ["tls-webpki-roots"] }
 mimalloc = "0.1"
 parking_lot = "0.12"
 
